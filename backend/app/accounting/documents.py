@@ -15,6 +15,9 @@ from ..llm.base import Attachment
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 _MAX_SHEET_ROWS = 5000
+# xlsx შეკუმშული ZIP-ია: 25MB ფაილი შეიძლება ასობით MB ტექსტად "გაიშალოს" (zip bomb). LLM-ს
+# მაინც ვერ გავუგზავნით ამაზე დიდს, ამიტომ ვჩერდებით ადრე - მეხსიერების ამოწურვამდე.
+MAX_CSV_CHARS = 4_000_000
 
 
 class UnsupportedDocumentError(ValueError):
@@ -31,27 +34,40 @@ def detect_media_type(data: bytes, filename: str) -> str:
         return "image/jpeg"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
     if data.startswith(b"PK\x03\x04") and ext in (".xlsx", ".xlsm"):
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if data.startswith(b"\xd0\xcf\x11\xe0"):
+        raise UnsupportedDocumentError(f"{filename}: ძველი .xls ფორმატი - შეინახეთ როგორც .xlsx ან .csv")
     if ext in (".csv", ".txt"):
         return "text/csv" if ext == ".csv" else "text/plain"
-    raise UnsupportedDocumentError(f"{filename}: მხარდაუჭერელი ფორმატი (PDF, JPG, PNG, WEBP, XLSX, CSV)")
+    raise UnsupportedDocumentError(f"{filename}: მხარდაუჭერელი ფორმატი (PDF, JPG, PNG, WEBP, GIF, XLSX, CSV)")
 
 
-def xlsx_to_csv_text(data: bytes) -> str:
+def xlsx_to_csv_text(data: bytes, *, max_chars: int = MAX_CSV_CHARS) -> str:
     from openpyxl import load_workbook
 
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # დაზიანებული/ყალბი xlsx (zipfile.BadZipFile, KeyError, InvalidFileException...)
+        raise UnsupportedDocumentError(f"Excel ფაილი ვერ წაიკითხა: {type(exc).__name__}") from None
     out = io.StringIO()
     writer = csv.writer(out)
-    for ws in wb.worksheets:
-        out.write(f"# sheet: {ws.title}\n")
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i >= _MAX_SHEET_ROWS:
-                out.write(f"# ... truncated after {_MAX_SHEET_ROWS} rows\n")
-                break
-            if any(cell is not None for cell in row):
-                writer.writerow(["" if c is None else c for c in row])
+    try:
+        for ws in wb.worksheets:
+            out.write(f"# sheet: {ws.title}\n")
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= _MAX_SHEET_ROWS:
+                    out.write(f"# ... truncated after {_MAX_SHEET_ROWS} rows\n")
+                    break
+                if any(cell is not None for cell in row):
+                    writer.writerow(["" if c is None else c for c in row])
+                if out.tell() > max_chars:
+                    raise UnsupportedDocumentError(
+                        "Excel ფაილი ზედმეტად დიდია LLM-ით დასამუშავებლად - დაყავით ან ატვირთეთ CSV-ად")
+    finally:
+        wb.close()
     return out.getvalue()
 
 

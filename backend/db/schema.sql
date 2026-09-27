@@ -136,7 +136,11 @@ CREATE TABLE llm_credentials (
     last_error      text,
     created_by      uuid REFERENCES users(id),
     created_at      timestamptz NOT NULL DEFAULT now(),
-    rotated_at      timestamptz
+    rotated_at      timestamptz,
+    revoked_at      timestamptz,
+    UNIQUE (tenant_id, id),
+    -- გაუქმებული გასაღები "კრიპტო-წაშლილია" (შიფრტექსტი ცარიელია) და default ვეღარ იქნება
+    CHECK (status <> 'revoked' OR (NOT is_default AND octet_length(ciphertext) = 0))
 );
 CREATE UNIQUE INDEX llm_credentials_one_default ON llm_credentials (tenant_id) WHERE is_default;
 
@@ -186,11 +190,11 @@ CREATE INDEX documents_review_idx ON documents (tenant_id, status) WHERE status 
 CREATE TABLE llm_calls (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id       uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    llm_credential_id uuid REFERENCES llm_credentials(id) ON DELETE SET NULL,
+    llm_credential_id uuid,
     provider        llm_provider NOT NULL,
     model           text NOT NULL,
     purpose         llm_purpose NOT NULL,
-    input_sha256    bytea,                -- prompt+ფაილის ჰეში (შიგთავსს არ ვინახავთ)
+    input_sha256    bytea,                -- შემავალი ფაილის ჰეში (შიგთავსს არ ვინახავთ)
     output          jsonb,                -- ვალიდირებული structured output
     input_tokens    integer,
     output_tokens   integer,
@@ -198,7 +202,10 @@ CREATE TABLE llm_calls (
     latency_ms      integer,
     provider_request_id text,
     error_code      text,
-    created_at      timestamptz NOT NULL DEFAULT now()
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    -- კომპოზიტური FK: სხვა tenant-ის გასაღებზე მიბმა შეუძლებელია
+    FOREIGN KEY (tenant_id, llm_credential_id) REFERENCES llm_credentials (tenant_id, id)
+        ON DELETE SET NULL (llm_credential_id)
 );
 CREATE INDEX llm_calls_usage_idx ON llm_calls (tenant_id, created_at);
 
@@ -441,6 +448,46 @@ CREATE TABLE declaration_events (
     created_at      timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (tenant_id, declaration_id) REFERENCES declarations (tenant_id, id) ON DELETE CASCADE
 );
+CREATE INDEX declaration_events_decl_idx ON declaration_events (declaration_id, id);
+
+-- სტატუსების მანქანის უსაფრთხოების ინვარიანტები (DB-ის დონეზე, worker-ის ბაგის მიუხედავად):
+-- * approved     - მხოლოდ draft_prepared / awaiting_approval-დან (ადამიანმა ნახა ფორმა);
+-- * submitting   - მხოლოდ approved-დან (ან failed-დან ხელახლა, თუ დადასტურება ისევ ვალიდურია - CHECK);
+-- * submitted    - მხოლოდ submitting-დან (crash-ის შემდეგ worker-მა იცის, რომ rs.ge ჯერ უნდა შეამოწმოს);
+-- * submitted/cancelled - საბოლოოა. დაზუსტებული დეკლარაცია = ახალი ჩანაწერი.
+CREATE OR REPLACE FUNCTION check_declaration_transition() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status IN ('approved', 'submitting', 'submitted') THEN
+            RAISE EXCEPTION 'declaration cannot be created in status %', NEW.status USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status = 'submitted' AND ROW(NEW.status, NEW.type, NEW.taxpayer_id, NEW.period_start, NEW.period_end,
+            NEW.is_zero, NEW.form_values, NEW.form_fingerprint, NEW.approved_by, NEW.approved_at,
+            NEW.approved_fingerprint, NEW.rs_receipt_number, NEW.submitted_at)
+        IS DISTINCT FROM ROW(OLD.status, OLD.type, OLD.taxpayer_id, OLD.period_start, OLD.period_end,
+            OLD.is_zero, OLD.form_values, OLD.form_fingerprint, OLD.approved_by, OLD.approved_at,
+            OLD.approved_fingerprint, OLD.rs_receipt_number, OLD.submitted_at) THEN
+        RAISE EXCEPTION 'submitted declaration % is immutable; file an amended declaration instead', OLD.id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+        IF OLD.status = 'cancelled'
+           OR (NEW.status = 'approved' AND OLD.status NOT IN ('draft_prepared', 'awaiting_approval'))
+           OR (NEW.status = 'submitting' AND OLD.status NOT IN ('approved', 'failed'))
+           OR (NEW.status = 'submitted' AND OLD.status <> 'submitting') THEN
+            RAISE EXCEPTION 'invalid declaration transition % -> %', OLD.status, NEW.status
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER declarations_transition BEFORE INSERT OR UPDATE ON declarations
+    FOR EACH ROW EXECUTE FUNCTION check_declaration_transition();
 
 CREATE OR REPLACE FUNCTION log_declaration_status() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -535,6 +582,7 @@ CREATE INDEX reminders_due_idx ON reminders (send_at) WHERE sent_at IS NULL;
 CREATE TABLE audit_log (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id       uuid NOT NULL REFERENCES tenants(id),
+    seq             bigint NOT NULL,      -- tenant-ის ჯაჭვში რიგითი ნომერი (1, 2, 3, ... უწყვეტი)
     actor_type      actor_type NOT NULL,
     actor_id        uuid,
     action          text NOT NULL,        -- 'llm_key.created', 'declaration.approved', 'rsge.submitted', ...
@@ -544,21 +592,55 @@ CREATE TABLE audit_log (
     ip              inet,
     created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
     prev_hash       bytea,
-    hash            bytea NOT NULL
+    hash            bytea NOT NULL,
+    UNIQUE (tenant_id, seq)               -- ჯაჭვის "განშტოება" შეუძლებელია (კონკურენტული ჩაწერისასაც)
 );
-CREATE INDEX audit_log_tenant_idx ON audit_log (tenant_id, id);
+
+-- ჰეშის შემავალი მონაცემები - jsonb მასივი: ცალსახაა (NULL != ცარიელი სტრიქონი, ველები არ "იძვრის")
+-- და არ არის დამოკიდებული სესიის TimeZone/DateStyle პარამეტრებზე (created_at - UTC, ფიქსირებული ფორმატი).
+CREATE OR REPLACE FUNCTION audit_log_hash(p_prev bytea, p_tenant uuid, p_seq bigint, p_actor_type actor_type,
+    p_actor_id uuid, p_action text, p_entity_type text, p_entity_id text, p_details jsonb, p_ip inet,
+    p_created_at timestamptz) RETURNS bytea
+LANGUAGE sql STABLE AS $$
+    SELECT sha256(convert_to(jsonb_build_array(
+        encode(coalesce(p_prev, ''::bytea), 'hex'), p_tenant::text, p_seq, p_actor_type::text, p_actor_id::text,
+        p_action, p_entity_type, p_entity_id, p_details, p_ip::text,
+        to_char(p_created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))::text, 'UTF8'))
+$$;
 
 CREATE OR REPLACE FUNCTION audit_log_chain() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_last record;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended('audit:' || NEW.tenant_id::text, 0));
-    SELECT hash INTO NEW.prev_hash FROM audit_log WHERE tenant_id = NEW.tenant_id ORDER BY id DESC LIMIT 1;
-    NEW.hash := sha256(convert_to(concat_ws('|',
-        encode(coalesce(NEW.prev_hash, ''::bytea), 'hex'), NEW.tenant_id, NEW.actor_type, NEW.actor_id,
-        NEW.action, NEW.entity_type, NEW.entity_id, NEW.details::text, NEW.created_at), 'UTF8'));
+    SELECT seq, hash INTO v_last FROM audit_log WHERE tenant_id = NEW.tenant_id ORDER BY seq DESC LIMIT 1;
+    NEW.seq := coalesce(v_last.seq, 0) + 1;
+    NEW.prev_hash := v_last.hash;
+    NEW.hash := audit_log_hash(NEW.prev_hash, NEW.tenant_id, NEW.seq, NEW.actor_type, NEW.actor_id, NEW.action,
+                               NEW.entity_type, NEW.entity_id, NEW.details, NEW.ip, NEW.created_at);
     RETURN NEW;
 END $$;
 CREATE TRIGGER audit_log_chain BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION audit_log_chain();
+
+-- მიმდინარე tenant-ის ჯაჭვის შემოწმება: ჰეში ხელახლა ითვლება, prev_hash და seq-ის უწყვეტობა მოწმდება.
+-- first_broken_seq = NULL -> ჯაჭვი მთელია. (ბოლო ჩანაწერების წაშლის აღმოსაჩენად ბოლო ჰეში პერიოდულად
+-- გარე, WORM საცავშიც უნდა ჩაიწეროს - "anchoring".)
+CREATE OR REPLACE FUNCTION audit_log_verify(OUT checked bigint, OUT first_broken_seq bigint, OUT last_hash bytea)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE r record;
+BEGIN
+    checked := 0;
+    FOR r IN SELECT * FROM audit_log WHERE tenant_id = app_current_tenant() ORDER BY seq LOOP
+        IF r.seq <> checked + 1 OR r.prev_hash IS DISTINCT FROM last_hash
+           OR r.hash IS DISTINCT FROM audit_log_hash(r.prev_hash, r.tenant_id, r.seq, r.actor_type, r.actor_id,
+                   r.action, r.entity_type, r.entity_id, r.details, r.ip, r.created_at) THEN
+            first_broken_seq := r.seq;
+            RETURN;
+        END IF;
+        checked := checked + 1;
+        last_hash := r.hash;
+    END LOOP;
+END $$;
 
 CREATE OR REPLACE FUNCTION forbid_modification() RETURNS trigger
 LANGUAGE plpgsql AS $$

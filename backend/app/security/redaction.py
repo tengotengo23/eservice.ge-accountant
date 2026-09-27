@@ -27,8 +27,16 @@ class RedactingFilter(logging.Filter):
         return True
 
 
+# uvicorn-ის logger-ებს საკუთარი handler-ები აქვთ და root-ზე არ "ადიან" (propagate=False) -
+# access log-ში query string-იც ჩანს, ამიტომ ფილტრი მათაც სჭირდებათ.
+_DEFAULT_LOGGERS = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+
+
 def install_redaction(logger: logging.Logger | None = None) -> None:
-    target = logger or logging.getLogger()
-    for handler in target.handlers or [logging.lastResort]:
-        if handler is not None:
-            handler.addFilter(RedactingFilter())
+    """idempotent: ყოველ handler-ს ერთი RedactingFilter ემატება, რამდენჯერაც არ უნდა გამოვიძახოთ."""
+    targets = [logger] if logger is not None else [logging.getLogger(name) for name in _DEFAULT_LOGGERS]
+    for target in targets:
+        handlers = target.handlers or ([logging.lastResort] if target is logging.getLogger() else [])
+        for handler in handlers:
+            if handler is not None and not any(isinstance(f, RedactingFilter) for f in handler.filters):
+                handler.addFilter(RedactingFilter())

@@ -154,11 +154,20 @@ def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, 
         if rule.action is DeclarationAction.FILE_ZERO:
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     elif rule.action is not DeclarationAction.NEEDS_HUMAN_REVIEW:
-        if llm.action is not rule.action:
+        if (llm.declaration_type, llm.period) != (rule.declaration_type, rule.period):
+            # მოდელმა სხვა დეკლარაციაზე/პერიოდზე "უპასუხა" - მისი დასკვნა ამ დეკლარაციისთვის არ ითვლება
+            reasons.append(f"AI-ის პასუხი ეხება {llm.declaration_type.value} {llm.period}-ს, "
+                           f"მოთხოვნილი იყო {rule.declaration_type.value} {rule.period}")
+            action = DeclarationAction.NEEDS_HUMAN_REVIEW
+        elif llm.action is not rule.action:
             reasons.append(f"წესები: {rule.action.value}, AI: {llm.action.value} - საჭიროა ბუღალტრის გადაწყვეტილება")
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
         elif llm.confidence < threshold:
             reasons.append(f"AI-ის დარწმუნებულობა დაბალია ({llm.confidence:.2f} < {threshold:.2f})")
+            action = DeclarationAction.NEEDS_HUMAN_REVIEW
+        elif action is DeclarationAction.FILE_ZERO and llm.blocking_issues:
+            # "ნულოვანი, მაგრამ..." - თვითწინააღმდეგობრივი პასუხი ავტომატურ წარდგენას არ იძლევა
+            reasons.append("AI-მ მიუთითა ხელის შემშლელი გარემოებები: " + "; ".join(llm.blocking_issues))
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     return FinalDeclarationDecision(action=action, rule_decision=rule, llm_decision=llm, reasons=reasons)
 

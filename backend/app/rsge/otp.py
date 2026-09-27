@@ -80,6 +80,17 @@ class InMemoryOtpBroker:
         return True
 
 
+# owner-ის შემოწმება + pending-ის წაშლა + კოდის ჩადება - ერთ ატომურ ოპერაციად: მეორე (თუნდაც
+# ერთდროული) მიწოდება ვერ "გაიპარება" და API ცალსახად პასუხობს 404-ით.
+_SUBMIT_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+redis.call('RPUSH', KEYS[2], ARGV[2])
+redis.call('EXPIRE', KEYS[2], 60)
+return 1
+"""
+
+
 class RedisOtpBroker:
     """prod: worker და API სხვადასხვა პროცესშია. BLPOP - ერთჯერადი მიწოდება."""
 
@@ -87,6 +98,7 @@ class RedisOtpBroker:
         self._redis = redis  # redis.asyncio.Redis
         self._notifier = notifier
         self._prefix = prefix
+        self._submit = redis.register_script(_SUBMIT_LUA)
 
     def _pending_key(self, challenge_id: str) -> str:
         return f"{self._prefix}:pending:{challenge_id}"
@@ -108,14 +120,8 @@ class RedisOtpBroker:
             await self._redis.delete(self._pending_key(challenge.id), self._code_key(challenge.id))
 
     async def submit_code(self, challenge_id: str, code: str, *, tenant_id: str) -> bool:
-        """მხოლოდ იგივე tenant-ს შეუძლია კოდის მიწოდება; გამოწურულ/უცნობ challenge-ზე - False."""
-        owner = await self._redis.get(self._pending_key(challenge_id))
-        owner = owner.decode() if isinstance(owner, bytes) else owner
-        if owner != tenant_id:
-            return False
-        key = self._code_key(challenge_id)
-        async with self._redis.pipeline(transaction=True) as pipe:
-            pipe.rpush(key, validate_code(code))
-            pipe.expire(key, 60)
-            await pipe.execute()
-        return True
+        """მხოლოდ იგივე tenant-ს შეუძლია კოდის მიწოდება, მხოლოდ ერთხელ; გამოწურულ/უცნობ challenge-ზე - False."""
+        code = validate_code(code)
+        accepted = await self._submit(keys=[self._pending_key(challenge_id), self._code_key(challenge_id)],
+                                      args=[tenant_id, code])
+        return bool(accepted)
