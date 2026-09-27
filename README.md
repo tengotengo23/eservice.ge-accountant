@@ -5,6 +5,7 @@ SaaS პლატფორმის ბირთვი, რომელიც �
 მომზადება და წარდგენა eservice.rs.ge-ზე — **მომხმარებლის საკუთარი** Claude / ChatGPT / Gemini გასაღებით.
 
 📐 სრული არქიტექტურა, უსაფრთხოება და რისკები: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+🛠️ გასწორებული ხარვეზები და შემდეგი ნაბიჯები (პრიორიტეტებით): **[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md)**
 
 ## რა არის აქ
 
@@ -16,6 +17,7 @@ SaaS პლატფორმის ბირთვი, რომელიც �
 | AI ბუღალტრის ლოგიკა | [`backend/app/accounting/ai_accountant.py`](backend/app/accounting/ai_accountant.py), [`validation.py`](backend/app/accounting/validation.py), [`tax_calendar.py`](backend/app/accounting/tax_calendar.py), [`reporting.py`](backend/app/accounting/reporting.py) |
 | მონაცემთა ბაზის სქემა | [`backend/db/schema.sql`](backend/db/schema.sql) |
 | საიდუმლოებების დაშიფვრა | [`backend/app/security/crypto.py`](backend/app/security/crypto.py) |
+| ავთენტიფიკაცია (OIDC JWT) და როლები | [`backend/app/security/auth.py`](backend/app/security/auth.py), [`backend/app/api/deps.py`](backend/app/api/deps.py) |
 | რისკები (2FA, CAPTCHA, პასუხისმგებლობა) | [`docs/ARCHITECTURE.md#6-რისკები-და-შეზღუდვები`](docs/ARCHITECTURE.md) |
 
 ## მაგალითი: დოკუმენტის დამუშავება არჩეული პროვაიდერით
@@ -57,8 +59,13 @@ uvicorn app.main:app --reload
 cd backend
 pytest                                   # unit + Playwright (ყალბ პორტალზე); DB/Redis ტესტები გამოტოვდება
 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
-TEST_REDIS_URL=redis://localhost:6379/1 pytest   # სრული ნაკრები
+TEST_REDIS_URL=redis://localhost:6379/1 pytest   # სრული ნაკრები (80 ტესტი)
+ruff check app tests                     # lint (იგივე, რაც CI-ში)
 ```
+
+API dev რეჟიმში: header-ები `X-Tenant-Id` და `X-User-Id` (მომხმარებელი უნდა იყოს tenant-ის წევრი —
+როლი მოდის `tenant_members`-იდან). staging/prod: `APP_AUTH_MODE=oidc` + `Authorization: Bearer <JWT>`
+(იხ. `backend/.env.example`).
 
 ## ⚠️ production-მდე აუცილებელი
 
@@ -66,5 +73,6 @@ TEST_REDIS_URL=redis://localhost:6379/1 pytest   # სრული ნაკრ�
    (`playwright codegen https://eservice.rs.ge`) ავტორიზებული სატესტო ანგარიშით.
 2. `backend/app/rsge/soap.py` — ოპერაციების სიგნატურების გადამოწმება WSDL-თან.
 3. `tax_calendar.py` და `ZERO_ACTIVITY_POLICY` — სერტიფიცირებული ბუღალტრის დადასტურება.
-4. OIDC ავთენტიფიკაცია (`app/api/deps.py`) — ახლა მხოლოდ dev header-ებია.
+4. IdP-ის (Keycloak / Auth0 / Cognito) კონფიგურაცია: `APP_AUTH_MODE=oidc`, MFA owner/accountant-ისთვის,
+   `users.auth_subject`-ის შევსება (JWT-ის შემოწმება უკვე დანერგილია — `app/security/auth.py`).
 5. იურიდიული: ToS, რწმუნებულება/მანდატი, პერსონალური მონაცემების საზღვარგარეთ გადაცემა (LLM).

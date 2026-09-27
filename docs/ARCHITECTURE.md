@@ -89,6 +89,7 @@ backend/
   app/
     config.py                  პარამეტრები (APP_* გარემოს ცვლადები)
     security/crypto.py         envelope encryption (AES-256-GCM + KMS), AAD tenant-ზე მიბმით
+    security/auth.py           OIDC access token (JWT) შემოწმება JWKS-ით; როლები - DB-დან (api/deps.py)
     security/redaction.py      ლოგებიდან გასაღებების/პაროლების ამოღება
     llm/router.py              LLMRouter: ვალიდაცია, repair, retry, fallback
     llm/schema.py              Pydantic -> "strict" JSON Schema (სამივე პროვაიდერისთვის)
@@ -102,10 +103,10 @@ backend/
     rsge/selectors.py          ⚠️ სელექტორები — ჩასანაცვლებელია რეალური DOM-ით
     rsge/otp.py                SMS კოდის human-in-the-loop broker (Redis)
     rsge/soap.py               WayBillService კლიენტი (სერვისის მომხმარებელი)
-    services/llm_keys.py       BYOK: გასაღების შემოწმება, დაშიფვრა, შენახვა
+    services/llm_keys.py       BYOK: გასაღების შემოწმება, დაშიფვრა, შენახვა, ნაგულისხმევი, გაუქმება
     api/routes.py              REST endpoint-ები
   db/schema.sql                PostgreSQL სქემა (RLS, ტრიგერები, აუდიტი)
-  tests/                       60 ტესტი (მათ შორის Playwright ყალბ პორტალზე, PostgreSQL, Redis)
+  tests/                       80 ტესტი (მათ შორის Playwright ყალბ პორტალზე, PostgreSQL, Redis)
 ```
 
 ---
@@ -250,7 +251,13 @@ sequenceDiagram
 
 ### 5.4 აუდიტი და მტკიცებულებები
 
-* `audit_log` — append-only (ტრიგერი + `REVOKE UPDATE, DELETE`), hash chain tenant-ის მიხედვით.
+* `audit_log` — append-only (ტრიგერი + `REVOKE UPDATE, DELETE`), hash chain tenant-ის მიხედვით:
+  ჰეში კანონიკური JSON-იდან (UTC დრო), რიგი — `seq` (ლოკის ქვეშ); შემოწმება —
+  `SELECT * FROM audit_log_verify('<tenant>')`. ბოლო ჰეში პერიოდულად → WORM საცავი (anchoring).
+* ჟურნალი: გატარებულ ჩანაწერს ვერც სტრიქონს დაამატებ, ვერც სათაურს (თარიღს) შეცვლი — მხოლოდ
+  `posted → reversed` და შემობრუნებული გატარება. ნაკადი: `draft` → სტრიქონები → `posted`.
+* დეკლარაცია: `approved_*` ველებს წერს მხოლოდ თავად დამდასტურებელი owner/accountant
+  (`app.actor_type='user'`), ან `system` — ნულოვანზე და `auto_submit_zero` თანხმობით; წარდგენილი — უცვლელია.
 * `declaration_events` — სტატუსის ყოველი ცვლილება, ვინ (user/ai/worker/system).
 * rs.ge-ს ყოველ ოპერაციაზე: screenshot-ები + `manifest.json` (sha256) + Playwright `trace.zip`
   → S3 Object Lock. დავის შემთხვევაში ჩანს, რა იყო ფორმაში და ვინ დაადასტურა.
@@ -330,7 +337,9 @@ sequenceDiagram
 | eservice.rs.ge-ს რეალური სელექტორები | ❌ ჩასაწერია (`playwright codegen`) ავტორიზებული ანგარიშით |
 | rs.ge SOAP ოპერაციების სახელები/პარამეტრები | ⚠️ გადასამოწმებელია WSDL-თან (CI-დან rs.ge მიუწვდომელია) |
 | PostgreSQL სქემა (RLS, ბალანსი, დადასტურება, აუდიტი) | ✅ ტესტები PostgreSQL 16-ზე |
-| API (გასაღები, OTP, კალენდარი) | ✅ ინტეგრაციული ტესტები; ⚠️ ავთენტიფიკაცია — dev header-ები, prod-ისთვის OIDC ჩასასმელია |
+| API (გასაღები, OTP, კალენდარი, დოკუმენტი) | ✅ ინტეგრაციული ტესტები |
+| ავთენტიფიკაცია/ავტორიზაცია (OIDC JWT, როლები DB-დან, MFA) | ✅ ტესტები ლოკალური RSA გასაღებით; ⚠️ IdP-ის კონფიგურაცია და მომხმარებლების რეგისტრაცია — ჩასასმელი |
+| audit ჯაჭვი (`audit_log_verify`), ჟურნალის/დეკლარაციის DB-დაცვები | ✅ ტესტები PostgreSQL 16-ზე (პარალელური ჩაწერის ჩათვლით) |
 | Frontend, worker-ების რიგი, სინქრონიზაციის ამოცანები | ⏭️ შემდეგი ეტაპი |
 
 ---
