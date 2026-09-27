@@ -89,7 +89,8 @@ backend/
   app/
     config.py                  პარამეტრები (APP_* გარემოს ცვლადები)
     security/crypto.py         envelope encryption (AES-256-GCM + KMS), AAD tenant-ზე მიბმით
-    security/redaction.py      ლოგებიდან გასაღებების/პაროლების ამოღება
+    security/redaction.py      ლოგებიდან გასაღებების/პაროლების ამოღება (uvicorn access log-ის ჩათვლით)
+    security/oidc.py           OIDC: JWT + JWKS ვერიფიკაცია (მხოლოდ ასიმეტრიული ალგორითმები), MFA (`amr`)
     llm/router.py              LLMRouter: ვალიდაცია, repair, retry, fallback
     llm/schema.py              Pydantic -> "strict" JSON Schema (სამივე პროვაიდერისთვის)
     llm/providers/*.py         Claude / ChatGPT / Gemini ადაპტერები (ოფიციალური SDK)
@@ -102,10 +103,15 @@ backend/
     rsge/selectors.py          ⚠️ სელექტორები — ჩასანაცვლებელია რეალური DOM-ით
     rsge/otp.py                SMS კოდის human-in-the-loop broker (Redis)
     rsge/soap.py               WayBillService კლიენტი (სერვისის მომხმარებელი)
-    services/llm_keys.py       BYOK: გასაღების შემოწმება, დაშიფვრა, შენახვა
+    services/llm_keys.py       BYOK: გასაღების შემოწმება, დაშიფვრა, შენახვა, ნაგულისხმევი, გაუქმება (კრიპტო-წაშლა)
+    services/llm_usage.py      LLM ხარჯის აღრიცხვა (llm_calls) და შეჯამება
+    services/consents.py       თანხმობები (ai_processing და სხვ.) - ვერსია, IP, აუდიტი
+    services/declarations.py   დეკლარაციების სია/ისტორია, ადამიანის დადასტურება fingerprint-ზე
+    api/deps.py                ავთენტიფიკაცია (oidc | dev), როლი tenant_members-იდან
+    api/middleware.py          X-Request-Id (ლოგების კორელაცია), მოთხოვნის ზომის ლიმიტი
     api/routes.py              REST endpoint-ები
-  db/schema.sql                PostgreSQL სქემა (RLS, ტრიგერები, აუდიტი)
-  tests/                       60 ტესტი (მათ შორის Playwright ყალბ პორტალზე, PostgreSQL, Redis)
+  db/schema.sql                PostgreSQL სქემა (RLS, ტრიგერები, სტატუსების მანქანა, აუდიტის ჯაჭვი)
+  tests/                       95 ტესტი (Playwright ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
 ```
 
 ---
@@ -188,6 +194,12 @@ sequenceDiagram
 * **idempotency:** გაგზავნამდე მოწმდება, ხომ არ არის უკვე წარდგენილი (queue retry ≠ ორმაგი დეკლარაცია).
 * **DB constraint:** `declarations.status IN ('approved','submitting','submitted')` შეუძლებელია
   `approved_by` + `approved_fingerprint = form_fingerprint`-ის გარეშე.
+* **სტატუსების მანქანა (ტრიგერი):** `approved` მხოლოდ `draft_prepared`/`awaiting_approval`-დან,
+  `submitting` მხოლოდ `approved`-დან (ან `failed`-დან, თუ დადასტურება ისევ ვალიდურია), `submitted` მხოლოდ
+  `submitting`-დან; `submitted` და `cancelled` საბოლოოა (ქვითარი/ფორმა/დადასტურება აღარ იცვლება);
+  ჩანაწერი `approved` სტატუსით ვერ შეიქმნება. worker-ის ბაგიც ვერ "გამოტოვებს" ადამიანს.
+* **API-ს დადასტურება** (`POST /v1/declarations/{id}/approve`) იღებს იმ `fingerprint`-ს, რაც მომხმარებელმა
+  ეკრანზე ნახა; თუ worker-მა ამასობაში ფორმა ხელახლა მოამზადა -> `409 form_changed`.
 * **არასწორ პაროლზე/SMS კოდზე ხელახლა არ ვცდით** — ანგარიშის დაბლოკვის რისკი.
 
 "ავტომატური წარდგენა" (დადასტურების გარეშე) შეიძლება ჩაირთოს მხოლოდ tenant-ის ცალსახა,
@@ -250,7 +262,12 @@ sequenceDiagram
 
 ### 5.4 აუდიტი და მტკიცებულებები
 
-* `audit_log` — append-only (ტრიგერი + `REVOKE UPDATE, DELETE`), hash chain tenant-ის მიხედვით.
+* `audit_log` — append-only (ტრიგერი + `REVOKE UPDATE, DELETE`), hash chain tenant-ის მიხედვით:
+  უწყვეტი `seq` (`UNIQUE (tenant_id, seq)` - ჯაჭვი ვერ "განიშტოება"), ჰეშის შემავალი - jsonb მასივი
+  (ცალსახა, სესიის TimeZone-ზე დამოუკიდებელი). `audit_log_verify()` / `GET /v1/audit/verify` ჰეშებს
+  ხელახლა ითვლის და პირველ დაზიანებულ `seq`-ს აბრუნებს; ბოლო ჩანაწერების წაშლის აღმოსაჩენად `last_hash`
+  პერიოდულად გარე WORM საცავში უნდა ჩაიწეროს.
+* ყოველი ცვლილება (გასაღები, თანხმობა, დადასტურება) აუდიტში იწერება მომხმარებლით და IP-ით.
 * `declaration_events` — სტატუსის ყოველი ცვლილება, ვინ (user/ai/worker/system).
 * rs.ge-ს ყოველ ოპერაციაზე: screenshot-ები + `manifest.json` (sha256) + Playwright `trace.zip`
   → S3 Object Lock. დავის შემთხვევაში ჩანს, რა იყო ფორმაში და ვინ დაადასტურა.
@@ -330,7 +347,9 @@ sequenceDiagram
 | eservice.rs.ge-ს რეალური სელექტორები | ❌ ჩასაწერია (`playwright codegen`) ავტორიზებული ანგარიშით |
 | rs.ge SOAP ოპერაციების სახელები/პარამეტრები | ⚠️ გადასამოწმებელია WSDL-თან (CI-დან rs.ge მიუწვდომელია) |
 | PostgreSQL სქემა (RLS, ბალანსი, დადასტურება, აუდიტი) | ✅ ტესტები PostgreSQL 16-ზე |
-| API (გასაღები, OTP, კალენდარი) | ✅ ინტეგრაციული ტესტები; ⚠️ ავთენტიფიკაცია — dev header-ები, prod-ისთვის OIDC ჩასასმელია |
+| API (გასაღები, OTP, კალენდარი, თანხმობები, ხარჯი, დეკლარაციის დადასტურება, აუდიტი) | ✅ ინტეგრაციული ტესტები PostgreSQL-ზე |
+| OIDC ავთენტიფიკაცია + MFA | ✅ ნამდვილი RS256 ხელმოწერებით (alg confusion, ვადა, aud/iss); ⚠️ IdP-ის კონფიგურაცია — deploy-ზე |
+| Docker image | ✅ non-root, healthcheck; CI ამოწმებს, რომ Chromium ეშვება appuser-ით |
 | Frontend, worker-ების რიგი, სინქრონიზაციის ამოცანები | ⏭️ შემდეგი ეტაპი |
 
 ---
