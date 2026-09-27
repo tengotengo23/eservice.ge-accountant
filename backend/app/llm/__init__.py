@@ -4,6 +4,7 @@ from .base import (
     LLMAuthError,
     LLMCredentials,
     LLMError,
+    LLMInputTooLargeError,
     LLMOutputValidationError,
     LLMRateLimitError,
     LLMRefusalError,
@@ -16,7 +17,7 @@ from .base import (
 from .router import LLMRouter
 
 __all__ = [
-    "Attachment", "Effort", "LLMAuthError", "LLMCredentials", "LLMError", "LLMOutputValidationError",
-    "LLMRateLimitError", "LLMRefusalError", "LLMRequestError", "LLMRouter", "LLMTruncatedError",
-    "LLMUnavailableError", "Provider", "StructuredResult",
+    "Attachment", "Effort", "LLMAuthError", "LLMCredentials", "LLMError", "LLMInputTooLargeError",
+    "LLMOutputValidationError", "LLMRateLimitError", "LLMRefusalError", "LLMRequestError", "LLMRouter",
+    "LLMTruncatedError", "LLMUnavailableError", "Provider", "StructuredResult",
 ]

@@ -10,6 +10,7 @@ from ..base import (
     Attachment,
     Effort,
     LLMAuthError,
+    LLMInputTooLargeError,
     LLMRateLimitError,
     LLMRefusalError,
     LLMRequestError,
@@ -18,6 +19,7 @@ from ..base import (
     Provider,
     RawCompletion,
     Usage,
+    error_for_status,
 )
 
 # `output_config.effort` მხარდაჭერილი მოდელები (Haiku 4.5 / Sonnet 4.5-ზე შეცდომას აბრუნებს).
@@ -95,10 +97,12 @@ class AnthropicAdapter:
             raise LLMAuthError(f"Claude API key lacks permission: {exc.message}", provider=self.provider) from exc
         except anthropic.RateLimitError as exc:
             raise LLMRateLimitError("Claude rate limit", provider=self.provider) from exc
+        except anthropic.RequestTooLargeError as exc:  # 413: ხელახალი ცდა აზრს მოკლებულია
+            raise LLMInputTooLargeError("Claude: request exceeds the size limit", provider=self.provider) from exc
         except (anthropic.BadRequestError, anthropic.NotFoundError, anthropic.UnprocessableEntityError) as exc:
             raise LLMRequestError(f"Claude rejected the request: {exc.message}", provider=self.provider) from exc
         except anthropic.APIStatusError as exc:
-            raise LLMUnavailableError(f"Claude API error {exc.status_code}", provider=self.provider) from exc
+            raise error_for_status(exc.status_code, f"Claude API error {exc.status_code}", self.provider) from exc
         except anthropic.APIConnectionError as exc:
             raise LLMUnavailableError("Claude API unreachable", provider=self.provider) from exc
 
@@ -122,9 +126,9 @@ class AnthropicAdapter:
         client = self._client(api_key)
         try:
             return [m.id async for m in client.models.list()]
-        except anthropic.AuthenticationError as exc:
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
             raise LLMAuthError("Claude API key is invalid or revoked", provider=self.provider) from exc
         except anthropic.APIStatusError as exc:
-            raise LLMUnavailableError(f"Claude API error {exc.status_code}", provider=self.provider) from exc
+            raise error_for_status(exc.status_code, f"Claude API error {exc.status_code}", self.provider) from exc
         except anthropic.APIConnectionError as exc:
             raise LLMUnavailableError("Claude API unreachable", provider=self.provider) from exc

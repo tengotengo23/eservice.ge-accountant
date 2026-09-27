@@ -18,6 +18,7 @@ from ..base import (
     Provider,
     RawCompletion,
     Usage,
+    error_for_status,
 )
 
 # reasoning.effort მხოლოდ reasoning-მოდელებზე (gpt-4o-ზე შეცდომაა)
@@ -86,8 +87,8 @@ class OpenAIAdapter:
             raise LLMRateLimitError("OpenAI rate limit", provider=self.provider) from exc
         except (openai.BadRequestError, openai.NotFoundError, openai.UnprocessableEntityError) as exc:
             raise LLMRequestError(f"OpenAI rejected the request: {exc.message}", provider=self.provider) from exc
-        except openai.APIStatusError as exc:
-            raise LLMUnavailableError(f"OpenAI API error {exc.status_code}", provider=self.provider) from exc
+        except openai.APIStatusError as exc:  # 413 და სხვა 4xx - retry არ უშველის; 5xx - დროებითი
+            raise error_for_status(exc.status_code, f"OpenAI API error {exc.status_code}", self.provider) from exc
         except openai.APIConnectionError as exc:
             raise LLMUnavailableError("OpenAI API unreachable", provider=self.provider) from exc
 
@@ -109,10 +110,10 @@ class OpenAIAdapter:
         client = self._client(api_key)
         try:
             ids = [m.id async for m in client.models.list()]
-        except openai.AuthenticationError as exc:
+        except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
             raise LLMAuthError("OpenAI API key is invalid or revoked", provider=self.provider) from exc
         except openai.APIStatusError as exc:
-            raise LLMUnavailableError(f"OpenAI API error {exc.status_code}", provider=self.provider) from exc
+            raise error_for_status(exc.status_code, f"OpenAI API error {exc.status_code}", self.provider) from exc
         except openai.APIConnectionError as exc:
             raise LLMUnavailableError("OpenAI API unreachable", provider=self.provider) from exc
         return sorted(

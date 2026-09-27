@@ -129,6 +129,10 @@ class LLMRequestError(LLMError):
     """400/404: არასწორი მოდელი, ზედმეტად დიდი ფაილი და ა.შ."""
 
 
+class LLMInputTooLargeError(LLMRequestError):
+    """413 ან ჩვენი წინასწარი შემოწმება: ფაილი/მოთხოვნა პროვაიდერის ლიმიტს აჭარბებს - საჭიროა დაყოფა."""
+
+
 class LLMRefusalError(LLMError):
     """მოდელმა უარი თქვა (safety). დოკუმენტი გადადის ადამიანის განხილვაზე."""
 
@@ -139,3 +143,15 @@ class LLMTruncatedError(LLMError):
 
 class LLMOutputValidationError(LLMError):
     """მოდელის JSON არ შეესაბამება სქემას (რამდენიმე მცდელობის შემდეგაც)."""
+
+
+def error_for_status(status: int, message: str, provider: Provider) -> LLMError:
+    """HTTP სტატუსი -> ჩვენი შეცდომა, რომლის ტიპი განსაზღვრავს retry/fallback-ს.
+
+    4xx (გარდა 408/409/429) - მოთხოვნაა არასწორი, ხელახალი ცდა არ უშველის. 5xx/529 - დროებითია.
+    """
+    if status == 413:
+        return LLMInputTooLargeError(message, provider=provider)
+    if 400 <= status < 500 and status not in (408, 409, 429):
+        return LLMRequestError(message, provider=provider)
+    return LLMUnavailableError(message, provider=provider)

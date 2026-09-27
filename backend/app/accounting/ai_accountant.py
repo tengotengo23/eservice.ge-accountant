@@ -97,6 +97,8 @@ def rule_based_decision(
     dtype: DeclarationType,
     policy: dict[DeclarationType, DeclarationAction] = ZERO_ACTIVITY_POLICY,
 ) -> DeclarationDecision:
+    """აქტივობა = ნებისმიერი არანულოვანი თანხა, უარყოფითის ჩათვლით (კორექტირება / კრედიტ-ნოტა /
+    დაბრუნება ნულოვან დეკლარაციას არ ნიშნავს - პირიქით, დაზუსტებას საჭიროებს)."""
     def decision(action: DeclarationAction, why: str, issues: list[str] | None = None) -> DeclarationDecision:
         return DeclarationDecision(declaration_type=dtype, period=facts.period, action=action,
                                    reasoning_ka=why, blocking_issues=issues or [], confidence=1.0)
@@ -109,22 +111,24 @@ def rule_based_decision(
         if not facts.is_vat_payer:
             return decision(DeclarationAction.NOT_REQUIRED, "კომპანია არ არის დღგ-ის გადამხდელი.")
         activity = []
-        if facts.sales_invoices_count or facts.sales_total > _ZERO:
+        if facts.sales_invoices_count or facts.sales_total != _ZERO:
             activity.append("გაცემულია ანგარიშ-ფაქტურები / არის რეალიზაცია")
-        if facts.purchase_vat_total > _ZERO:
+        if facts.purchase_vat_total != _ZERO:
             activity.append("არის ჩასათვლელი დღგ შესყიდვებზე")
         if facts.outgoing_waybills_count:
             activity.append("გაწერილია გამავალი ზედნადებები")
         if activity:
             return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში იყო დღგ-ით დასაბეგრი ოპერაციები.", activity)
-        if facts.bank_inflows_unexplained_total > _ZERO:
-            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW, "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
+        if facts.bank_inflows_unexplained_total != _ZERO:
+            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
+                            "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
                             [f"აუხსნელი შემოსავალი: {facts.bank_inflows_unexplained_total} ₾"])
         return decision(policy[dtype], "პერიოდში დღგ-ით დასაბეგრი ოპერაცია არ დაფიქსირებულა.")
 
     if dtype is DeclarationType.INCOME_TAX_WITHHOLDING:
-        if facts.salary_payments_total > _ZERO or facts.other_withholding_payments_total > _ZERO:
-            return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
+        if facts.salary_payments_total != _ZERO or facts.other_withholding_payments_total != _ZERO:
+            return decision(DeclarationAction.FILE_WITH_DATA,
+                            "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
         if facts.has_employees:
             return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
                             "კომპანიას ჰყავს დასაქმებულები, მაგრამ ხელფასის გაცემა არ ჩანს.",
@@ -132,21 +136,22 @@ def rule_based_decision(
         return decision(policy[dtype], "პერიოდში ხელფასი ან სხვა დასაბეგრი ანაზღაურება არ გაცემულა.")
 
     if dtype is DeclarationType.PROFIT_TAX:
-        if facts.dividends_paid_total > _ZERO or facts.non_business_expenses_total > _ZERO:
+        if facts.dividends_paid_total != _ZERO or facts.non_business_expenses_total != _ZERO:
             return decision(DeclarationAction.FILE_WITH_DATA, "გაცემულია დივიდენდი ან არის არაეკონომიკური ხარჯი.")
         return decision(policy[dtype], "მოგების გადასახადის ობიექტი პერიოდში არ წარმოშობილა.")
 
     if dtype is DeclarationType.SMALL_BUSINESS:
-        if facts.sales_total > _ZERO or facts.sales_invoices_count:
+        if facts.sales_total != _ZERO or facts.sales_invoices_count:
             return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში იყო ბრუნვა.")
-        if facts.bank_inflows_unexplained_total > _ZERO:
+        if facts.bank_inflows_unexplained_total != _ZERO:
             return decision(DeclarationAction.NEEDS_HUMAN_REVIEW, "ბანკში შემოსულია აუხსნელი თანხა.")
         return decision(policy[dtype], "პერიოდში ბრუნვა არ ყოფილა.")
 
     raise ValueError(f"unsupported declaration type {dtype}")
 
 
-def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *, threshold: float) -> FinalDeclarationDecision:
+def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *,
+                    threshold: float) -> FinalDeclarationDecision:
     reasons: list[str] = []
     action = rule.action
     if llm is None:
@@ -154,11 +159,19 @@ def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, 
         if rule.action is DeclarationAction.FILE_ZERO:
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     elif rule.action is not DeclarationAction.NEEDS_HUMAN_REVIEW:
-        if llm.action is not rule.action:
+        if (llm.declaration_type, llm.period.strip()) != (rule.declaration_type, rule.period):
+            # მოდელმა სხვა კითხვას უპასუხა (სხვა დეკლარაცია/პერიოდი) - მის "თანხმობას" ვერ ვენდობით
+            reasons.append(f"AI-ის პასუხი სხვა დეკლარაციას/პერიოდს ეხება ({llm.declaration_type.value} {llm.period})")
+            action = DeclarationAction.NEEDS_HUMAN_REVIEW
+        elif llm.action is not rule.action:
             reasons.append(f"წესები: {rule.action.value}, AI: {llm.action.value} - საჭიროა ბუღალტრის გადაწყვეტილება")
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
         elif llm.confidence < threshold:
             reasons.append(f"AI-ის დარწმუნებულობა დაბალია ({llm.confidence:.2f} < {threshold:.2f})")
+            action = DeclarationAction.NEEDS_HUMAN_REVIEW
+        elif rule.action is DeclarationAction.FILE_ZERO and llm.blocking_issues:
+            # "ნულოვანი, მაგრამ..." - თავად AI ასახელებს დაბრკოლებას, ავტომატური წარდგენა არ შეიძლება
+            reasons.append("AI ნულოვანს ეთანხმება, მაგრამ მიუთითებს დაბრკოლებებზე: " + "; ".join(llm.blocking_issues))
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     return FinalDeclarationDecision(action=action, rule_decision=rule, llm_decision=llm, reasons=reasons)
 
@@ -178,7 +191,7 @@ class AIAccountant:
         prompt = (
             f"ჩვენი კომპანიის საიდენტიფიკაციო კოდი: {our_tin}\n"
             f"ანგარიშთა გეგმა (აირჩიე მხოლოდ ამ კოდებიდან):\n{chart}\n\n"
-            f"ამოიღე მონაცემები თანდართული დოკუმენტიდან ({filename})."
+            f"ამოიღე მონაცემები თანდართული დოკუმენტიდან ({attachment.filename})."
         )
         result = await self._router.structured(
             creds, system=EXTRACTION_SYSTEM_PROMPT, prompt=prompt, output_model=ExtractedDocument,

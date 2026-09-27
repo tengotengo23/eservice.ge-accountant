@@ -31,6 +31,7 @@ from .base import (
     Effort,
     LLMCredentials,
     LLMError,
+    LLMInputTooLargeError,
     LLMOutputValidationError,
     LLMRequestError,
     Provider,
@@ -44,8 +45,15 @@ from .schema import strict_json_schema
 
 log = logging.getLogger(__name__)
 
-_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024  # ყველაზე მკაცრი ლიმიტი სამ პროვაიდერს შორის (Claude ~32MB request)
+# მოთხოვნის ზომის ლიმიტი base64-ის შემდეგ (ბინარული ფაილი იზრდება 4/3-ჯერ). ყველაზე მკაცრი სამს შორის -
+# Claude Messages API: 32MB მთლიან მოთხოვნაზე; ~2MB ვტოვებთ prompt-ისა და JSON-ის overhead-ისთვის.
+MAX_ENCODED_REQUEST_BYTES = 30 * 1024 * 1024
 _SUPPORTED_BINARY = {"application/pdf", "image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+def encoded_size(att: Attachment) -> int:
+    """რამდენ ბაიტს დაიკავებს ფაილი მოთხოვნაში: ბინარული - base64, ტექსტი - როგორც არის."""
+    return len(att.data) if att.is_text else 4 * ((len(att.data) + 2) // 3)
 
 
 def default_adapters() -> dict[Provider, ProviderAdapter]:
@@ -127,8 +135,7 @@ class LLMRouter:
                     raise
                 log.warning("LLM provider %s failed (%s); falling back to %s",
                             current.provider.value, type(exc).__name__, chain[index + 1].provider.value)
-        assert last_error is not None
-        raise last_error
+        raise last_error or LLMRequestError("no LLM credentials were given")
 
     async def _structured_single(self, creds, *, system, prompt, output_model: type[T], attachments,
                                  effort, max_output_tokens, repair_attempts) -> StructuredResult[T]:
@@ -178,12 +185,16 @@ class LLMRouter:
     @staticmethod
     def _check_attachments(attachments: tuple[Attachment, ...]) -> None:
         for att in attachments:
-            if len(att.data) > _MAX_ATTACHMENT_BYTES:
-                raise LLMRequestError(f"{att.filename}: file too large for LLM processing; split it first")
             if not (att.is_text or att.media_type in _SUPPORTED_BINARY):
                 raise LLMRequestError(
                     f"{att.filename}: unsupported media type {att.media_type} (convert Excel/Word to CSV/PDF first)"
                 )
+        # ლიმიტი მთლიან მოთხოვნაზეა და არა ცალკეულ ფაილზე: სამი 12MB-იანი PDF ერთად ვერ გაიგზავნება
+        total = sum(encoded_size(att) for att in attachments)
+        if total > MAX_ENCODED_REQUEST_BYTES:
+            raise LLMInputTooLargeError(
+                f"attachments are too large for one LLM request ({total // 1024 // 1024}MB encoded); split them first"
+            )
 
 
 def _repair_prompt(original_prompt: str, bad_output: str, error: ValidationError) -> str:

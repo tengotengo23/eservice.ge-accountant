@@ -150,7 +150,7 @@ class TaxPeriod:
         return f"{self.year}-{self.month:02d}" if self.month else str(self.year)
 
     @classmethod
-    def parse(cls, value: str) -> "TaxPeriod":
+    def parse(cls, value: str) -> TaxPeriod:
         parts = value.split("-")
         return cls(int(parts[0]), int(parts[1]) if len(parts) > 1 else None)
 
