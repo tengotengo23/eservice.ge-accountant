@@ -1,11 +1,14 @@
-# dev გარემო: PostgreSQL + Redis + API.  გაშვება:  docker compose up --build
+# dev გარემო: PostgreSQL + Redis + API.
+#   cp backend/.env.example backend/.env
+#   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"   # -> APP_LOCAL_MASTER_KEY
+#   docker compose up --build
 services:
   postgres:
     image: postgres:16
     environment:
       POSTGRES_DB: ai_accountant
       POSTGRES_PASSWORD: postgres
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]   # მხოლოდ ლოკალურად - dev პაროლით DB ქსელში არ უნდა ჩანდეს
     volumes:
       - ./backend/db/init/00-roles.sql:/docker-entrypoint-initdb.d/00-roles.sql:ro
       - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
@@ -16,7 +19,10 @@ services:
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
 
   api:
     build: ./backend
@@ -24,12 +30,13 @@ services:
       - path: ./backend/.env   # cp backend/.env.example backend/.env
         required: false
     environment:
+      APP_ENV: dev
       APP_DATABASE_URL: postgresql://ai_accountant_app:dev-only-change-me@postgres:5432/ai_accountant
       APP_REDIS_URL: redis://redis:6379/0
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
-      redis: {condition: service_started}
+      redis: {condition: service_healthy}
 
 volumes:
   pgdata:
