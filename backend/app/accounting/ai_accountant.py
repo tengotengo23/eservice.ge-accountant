@@ -118,13 +118,15 @@ def rule_based_decision(
         if activity:
             return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში იყო დღგ-ით დასაბეგრი ოპერაციები.", activity)
         if facts.bank_inflows_unexplained_total > _ZERO:
-            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW, "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
+            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
+                            "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
                             [f"აუხსნელი შემოსავალი: {facts.bank_inflows_unexplained_total} ₾"])
         return decision(policy[dtype], "პერიოდში დღგ-ით დასაბეგრი ოპერაცია არ დაფიქსირებულა.")
 
     if dtype is DeclarationType.INCOME_TAX_WITHHOLDING:
         if facts.salary_payments_total > _ZERO or facts.other_withholding_payments_total > _ZERO:
-            return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
+            return decision(DeclarationAction.FILE_WITH_DATA,
+                            "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
         if facts.has_employees:
             return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
                             "კომპანიას ჰყავს დასაქმებულები, მაგრამ ხელფასის გაცემა არ ჩანს.",
@@ -146,7 +148,8 @@ def rule_based_decision(
     raise ValueError(f"unsupported declaration type {dtype}")
 
 
-def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *, threshold: float) -> FinalDeclarationDecision:
+def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *,
+                    threshold: float) -> FinalDeclarationDecision:
     reasons: list[str] = []
     action = rule.action
     if llm is None:

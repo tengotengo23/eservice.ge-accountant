@@ -103,7 +103,8 @@ def _claude_adapter(captured: Captured, *, stop_reason="end_turn", text=None, st
             "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5",
             "content": [{"type": "text", "text": text if text is not None else json.dumps(VALID_DOC)}],
             "stop_reason": stop_reason, "stop_sequence": None,
-            "stop_details": {"type": "refusal", "category": "cyber", "explanation": None} if stop_reason == "refusal" else None,
+            "stop_details": ({"type": "refusal", "category": "cyber", "explanation": None}
+                             if stop_reason == "refusal" else None),
             "usage": {"input_tokens": 1200, "output_tokens": 300},
         })
 
@@ -171,7 +172,8 @@ def _openai_adapter(captured: Captured, *, output=None, status="completed"):
             "id": "resp_1", "object": "response", "created_at": 0, "status": status, "model": "gpt-6-sol",
             "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
             "output": output or [{"type": "message", "id": "m1", "status": "completed", "role": "assistant",
-                                  "content": [{"type": "output_text", "text": json.dumps(VALID_DOC), "annotations": []}]}],
+                                  "content": [{"type": "output_text", "text": json.dumps(VALID_DOC),
+                                               "annotations": []}]}],
             "usage": {"input_tokens": 900, "output_tokens": 250, "total_tokens": 1150},
         })
 

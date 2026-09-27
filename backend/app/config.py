@@ -64,6 +64,9 @@ class Settings(BaseSettings):
             missing = [n for n in ("oidc_issuer", "oidc_audience", "oidc_jwks_url") if not getattr(self, n)]
             if missing:
                 raise ValueError(f"auth_mode=oidc requires {', '.join('APP_' + m.upper() for m in missing)}")
+            from .security.oidc import check_algorithms
+
+            check_algorithms(self.oidc_algorithms)
         return self
 
 

@@ -14,7 +14,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from .errors import OtpTimeoutError
@@ -28,7 +28,7 @@ class OtpChallenge:
     credential_id: str
     phone_hint: str | None = None  # "***-**-12" - პორტალის გვერდიდან
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     ttl_seconds: int = 180
 
     @property
@@ -64,7 +64,7 @@ class InMemoryOtpBroker:
             if self._notifier:
                 await self._notifier(challenge)
             return await asyncio.wait_for(fut, timeout=challenge.ttl_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise OtpTimeoutError("user did not provide the SMS code in time") from None
         finally:
             self._pending.pop(challenge.id, None)

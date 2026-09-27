@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -120,7 +120,7 @@ class EvidenceRecorder:
         path = self.directory / f"{len(self.items):02d}-{label}.png"
         data = await page.screenshot(path=str(path), full_page=True)
         self.items.append({"label": label, "file": path.name, "sha256": hashlib.sha256(data).hexdigest(),
-                           "url": page.url, "at": datetime.now(timezone.utc).isoformat()})
+                           "url": page.url, "at": datetime.now(UTC).isoformat()})
         return path
 
     def write_manifest(self) -> Path:
@@ -150,7 +150,7 @@ class RsGeBrowserSession:
         self.evidence = EvidenceRecorder(evidence_dir)
         self.final_storage_state: dict[str, Any] | None = None
 
-    async def __aenter__(self) -> "RsGeBrowserSession":
+    async def __aenter__(self) -> RsGeBrowserSession:
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(headless=self._headless,
                                                        executable_path=self._executable_path)
@@ -196,7 +196,8 @@ class RsGePortal:
             await self.page.locator(selector).first.wait_for(state="visible", timeout=timeout)
         except PlaywrightTimeoutError:
             shot = await self.evidence.screenshot(self.page, f"missing-{what}")
-            raise PortalLayoutChangedError(f"expected element not found: {what} ({selector})", screenshot=shot) from None
+            raise PortalLayoutChangedError(f"expected element not found: {what} ({selector})",
+                                           screenshot=shot) from None
 
     async def _visible(self, selector: str) -> bool:
         return await self.page.locator(selector).first.is_visible()
@@ -375,7 +376,7 @@ async def prepare_zero_declaration(portal: RsGePortal, target: DeclarationTarget
     await portal.save_draft()
     shot = await portal.evidence.screenshot(portal.page, "draft-saved")
     return PreparedDeclaration(target=target, form_values=values, fingerprint=form_fingerprint(target, values),
-                               screenshot=shot, prepared_at=datetime.now(timezone.utc))
+                               screenshot=shot, prepared_at=datetime.now(UTC))
 
 
 async def submit_zero_declaration(portal: RsGePortal, target: DeclarationTarget,
@@ -392,4 +393,4 @@ async def submit_zero_declaration(portal: RsGePortal, target: DeclarationTarget,
     await portal.evidence.screenshot(portal.page, "before-submit")
     receipt_number = await portal.submit()
     shot = await portal.evidence.screenshot(portal.page, "submitted")
-    return SubmissionReceipt(receipt_number=receipt_number, submitted_at=datetime.now(timezone.utc), screenshot=shot)
+    return SubmissionReceipt(receipt_number=receipt_number, submitted_at=datetime.now(UTC), screenshot=shot)

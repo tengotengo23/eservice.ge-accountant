@@ -111,7 +111,6 @@ class LLMRouter:
         attachments = tuple(attachments)
         self._check_attachments(attachments)
         chain = [creds, *fallbacks]
-        last_error: LLMError | None = None
         for index, current in enumerate(chain):
             try:
                 return await self._structured_single(
@@ -120,15 +119,13 @@ class LLMRouter:
                     repair_attempts=repair_attempts,
                 )
             except LLMError as exc:
-                last_error = exc
                 has_next = index + 1 < len(chain)
                 # fallback აზრიანია მიუწვდომლობაზე/უარზე; არასწორი მოთხოვნა სხვაგანაც ჩავარდება
                 if not has_next or isinstance(exc, LLMRequestError):
                     raise
                 log.warning("LLM provider %s failed (%s); falling back to %s",
                             current.provider.value, type(exc).__name__, chain[index + 1].provider.value)
-        assert last_error is not None
-        raise last_error
+        raise AssertionError("unreachable: the last provider in the chain always re-raises")
 
     async def _structured_single(self, creds, *, system, prompt, output_model: type[T], attachments,
                                  effort, max_output_tokens, repair_attempts) -> StructuredResult[T]:

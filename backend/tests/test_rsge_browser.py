@@ -6,7 +6,7 @@
 
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -83,7 +83,7 @@ async def test_zero_vat_two_phase_flow_with_sms_code(tmp_path):
         assert prepared.screenshot.exists()
 
         # --- მომხმარებელმა ნახა screenshot და დაადასტურა; იგივე სესია (cookies) - SMS აღარ სჭირდება
-        approval = SubmissionApproval("decl-1", prepared.fingerprint, "user-7", datetime.now(timezone.utc))
+        approval = SubmissionApproval("decl-1", prepared.fingerprint, "user-7", datetime.now(UTC))
         async with session(tmp_path / "submit", storage_state) as s2:
             portal = RsGePortal(s2, base_url=portal_server.base_url)
             await portal.ensure_logged_in(CREDS, InMemoryOtpBroker())
@@ -150,7 +150,7 @@ async def test_form_changed_after_approval_blocks_submission(tmp_path):
             prepared = await prepare_zero_declaration(portal, TARGET)
             # დადასტურებასა და გაგზავნას შორის rs.ge-ზე ახალი ანგარიშ-ფაქტურა აისახა
             next(iter(state.declarations.values())).values["line_2"] = "90.00"
-            approval = SubmissionApproval("decl-1", prepared.fingerprint, "user-7", datetime.now(timezone.utc))
+            approval = SubmissionApproval("decl-1", prepared.fingerprint, "user-7", datetime.now(UTC))
             with pytest.raises(FingerprintMismatchError):
                 await submit_zero_declaration(portal, TARGET, approval)
     assert next(iter(state.declarations.values())).status == "დრაფტი"

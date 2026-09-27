@@ -110,7 +110,8 @@ class PeriodFacts(BaseModel):
     purchase_vat_total: Decimal = Decimal("0")
     outgoing_waybills_count: int = 0
     bank_inflows_total: Decimal = Decimal("0")
-    bank_inflows_unexplained_total: Decimal = Decimal("0")  # შემოსავალი, რომელიც სესხად/კაპიტალად არ არის კლასიფიცირებული
+    # შემოსავალი, რომელიც სესხად/კაპიტალად არ არის კლასიფიცირებული
+    bank_inflows_unexplained_total: Decimal = Decimal("0")
     salary_payments_total: Decimal = Decimal("0")
     other_withholding_payments_total: Decimal = Decimal("0")  # მომსახურება ფიზ. პირებისგან და ა.შ.
     dividends_paid_total: Decimal = Decimal("0")
