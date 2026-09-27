@@ -1,0 +1,35 @@
+# dev გარემო: PostgreSQL + Redis + API.  გაშვება:  docker compose up --build
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ai_accountant
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes:
+      - ./backend/db/init/00-roles.sql:/docker-entrypoint-initdb.d/00-roles.sql:ro
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  api:
+    build: ./backend
+    env_file:
+      - path: ./backend/.env   # cp backend/.env.example backend/.env
+        required: false
+    environment:
+      APP_DATABASE_URL: postgresql://ai_accountant_app:dev-only-change-me@postgres:5432/ai_accountant
+      APP_REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+
+volumes:
+  pgdata:
