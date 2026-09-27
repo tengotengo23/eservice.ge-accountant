@@ -1,0 +1,15 @@
+# image-ში მხოლოდ pyproject.toml და app/ ხვდება. საიდუმლოებები (.env) და მტკიცებულებები (var/) - არასდროს.
+.env
+.env.*
+var/
+tests/
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+*.zip
+test-results/
