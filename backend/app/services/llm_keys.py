@@ -58,6 +58,10 @@ async def register_llm_key(db: Database, router: LLMRouter, box: SecretBox, *, t
     cred_id = uuid4()
     secret = box.encrypt(api_key, SecretContext(str(tenant_id), PURPOSE, str(cred_id)))
     async with db.tenant_tx(tenant_id, actor_id=user_id) as conn:
+        if not make_default:
+            # აქტიური ნაგულისხმევი გასაღების გარეშე დოკუმენტების დამუშავება ვერ დაიწყება
+            cur = await conn.execute("SELECT 1 FROM llm_credentials WHERE is_default AND status = 'active'")
+            make_default = await cur.fetchone() is None
         if make_default:
             await conn.execute("UPDATE llm_credentials SET is_default = false WHERE is_default")
         cur = await conn.execute(

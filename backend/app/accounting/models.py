@@ -122,7 +122,7 @@ class PeriodFacts(BaseModel):
 
 class DeclarationDecision(BaseModel):
     declaration_type: DeclarationType
-    period: str
+    period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="საანგარიშო პერიოდი, YYYY-MM")
     action: DeclarationAction
     reasoning_ka: str = Field(description="ახსნა ქართულად, მარტივ ენაზე, მეწარმისთვის")
     blocking_issues: list[str] = Field(description="რა უშლის ხელს ავტომატურ წარდგენას")

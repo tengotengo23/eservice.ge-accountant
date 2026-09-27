@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from ..accounting.ai_accountant import AIAccountant
 from ..accounting.documents import MAX_UPLOAD_BYTES, UnsupportedDocumentError
-from ..accounting.tax_calendar import Regime, upcoming_deadlines
+from ..accounting.tax_calendar import Regime, tbilisi_today, upcoming_deadlines
 from ..llm import LLMAuthError, LLMError, LLMRefusalError, Provider
 from ..llm.router import default_model_for
 from ..services.llm_keys import (
@@ -112,7 +112,7 @@ class DeadlineOut(BaseModel):
 async def calendar(principal: Member, regimes: Annotated[list[Regime], Query()],
                    horizon_days: Annotated[int, Query(ge=1, le=400)] = 45,
                    today: date | None = None) -> list[DeadlineOut]:
-    items = upcoming_deadlines(today or date.today(), set(regimes), horizon_days=horizon_days)
+    items = upcoming_deadlines(today or tbilisi_today(), set(regimes), horizon_days=horizon_days)
     return [DeadlineOut(rule_code=d.rule.code, title_ka=d.rule.title_ka, period=str(d.period), due_date=d.due_date,
                         statutory_date=d.statutory_date, shifted_to_business_day=d.shifted,
                         requires_verification=d.rule.requires_verification) for d in items]

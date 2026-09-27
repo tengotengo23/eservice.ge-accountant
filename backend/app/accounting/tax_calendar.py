@@ -13,11 +13,20 @@ from __future__ import annotations
 
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from .models import DeclarationType
+
+TBILISI = ZoneInfo("Asia/Tbilisi")
+
+
+def tbilisi_today(now: datetime | None = None) -> date:
+    """"დღეს" საქართველოს დროით. სერვერი, როგორც წესი, UTC-შია: 00:00-04:00 შუალედში
+    `date.today()` ჯერ კიდევ გუშინდელ დღეს აბრუნებს (ვადები, "მომავალი თარიღის" შემოწმება)."""
+    return (now or datetime.now(timezone.utc)).astimezone(TBILISI).date()
 
 
 class Regime(str, Enum):

@@ -56,7 +56,7 @@ class OpenAIAdapter:
                 parts.append({"type": "input_image", "detail": "high",
                               "image_url": f"data:{att.media_type};base64,{b64}"})
             else:
-                parts.append({"type": "input_text", "text": f'<file name="{att.filename}">\n{att.as_text()}\n</file>'})
+                parts.append({"type": "input_text", "text": att.as_prompt_block()})
         parts.append({"type": "input_text", "text": prompt})
         return parts
 

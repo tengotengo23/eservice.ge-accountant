@@ -39,7 +39,7 @@ class GeminiAdapter:
             if att.is_pdf or att.is_image:
                 parts.append(types.Part.from_bytes(data=att.data, mime_type=att.media_type))
             else:
-                parts.append(types.Part.from_text(text=f'<file name="{att.filename}">\n{att.as_text()}\n</file>'))
+                parts.append(types.Part.from_text(text=att.as_prompt_block()))
         parts.append(types.Part.from_text(text=prompt))
         return parts
 

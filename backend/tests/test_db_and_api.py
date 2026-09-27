@@ -1,5 +1,6 @@
 """PostgreSQL სქემა (RLS, ბალანსი, დადასტურება, აუდიტი) + API-ის გასაღების ნაკადი. სჭირდება TEST_DATABASE_URL."""
 
+import asyncio
 import os
 import uuid
 
@@ -114,15 +115,65 @@ async def test_declaration_cannot_be_submitted_without_matching_approval(db, ids
         (None, "draft_prepared", "worker"), ("draft_prepared", "approved", "user"), ("approved", "submitted", "worker")]
 
 
-async def test_audit_log_is_append_only_hash_chain(db, ids):
+async def test_cross_tenant_references_are_rejected(db, ids):
+    async with db.tenant_tx(ids["tenant_b"]) as conn:
+        decl_b = (await (await conn.execute(
+            "INSERT INTO declarations (tenant_id, taxpayer_id, type, period_start, period_end, due_date)"
+            " VALUES (%s, %s, 'vat', '2026-09-01', '2026-09-30', '2026-10-15') RETURNING id",
+            (ids["tenant_b"], ids["tp_b"]))).fetchone())["id"]
     async with db.tenant_tx(ids["tenant_a"]) as conn:
-        for action in ("a", "b"):
-            await audit(conn, tenant_id=ids["tenant_a"], actor_type="user", actor_id=ids["user"], action=action)
-        rows = await (await conn.execute("SELECT prev_hash, hash FROM audit_log ORDER BY id")).fetchall()
-    assert rows[1]["prev_hash"] == rows[0]["hash"]
-    async with db.tenant_tx(ids["tenant_a"]) as conn:
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):  # FK-ის შემოწმება RLS-ს გვერდს უვლის
+            await conn.execute("INSERT INTO automation_runs (tenant_id, taxpayer_id, kind, declaration_id)"
+                               " VALUES (%s, %s, 'canary', %s)", (ids["tenant_a"], ids["tp_a"], decl_b))
+
+
+async def _verify_audit(conn) -> int | None:
+    return (await (await conn.execute("SELECT audit_log_verify() AS broken")).fetchone())["broken"]
+
+
+async def test_audit_log_is_append_only_verifiable_hash_chain(db, ids, pg_dsn):
+    tenant = ids["tenant_a"]
+    async with db.tenant_tx(tenant) as conn:
+        for action in ("a", "b", "c"):
+            await audit(conn, tenant_id=tenant, actor_type="user", actor_id=ids["user"], action=action)
+        rows = await (await conn.execute("SELECT seq, prev_hash, hash FROM audit_log ORDER BY seq")).fetchall()
+        assert [r["seq"] for r in rows] == [1, 2, 3] and rows[1]["prev_hash"] == rows[0]["hash"]
+        await conn.execute("SET LOCAL TimeZone = 'Pacific/Auckland'")  # ჰეში სესიის პარამეტრებს არ ეყრდნობა
+        assert await _verify_audit(conn) is None
+    async with db.tenant_tx(tenant) as conn:
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             await conn.execute("DELETE FROM audit_log")
+    # superuser-ს შეუძლია ტრიგერების გამორთვა - ჯაჭვი ცვლილებასაც და წაშლასაც აჩენს
+    with psycopg.connect(pg_dsn, autocommit=True) as c:
+        c.execute("SET session_replication_role = replica")
+        c.execute("UPDATE audit_log SET details = '{\"x\": 1}' WHERE tenant_id = %s AND seq = 3", (tenant,))
+        assert c.execute("SELECT audit_log_verify(%s)", (tenant,)).fetchone()[0] == 3
+        c.execute("DELETE FROM audit_log WHERE tenant_id = %s AND seq = 1", (tenant,))
+        assert c.execute("SELECT audit_log_verify(%s)", (tenant,)).fetchone()[0] == 1
+
+
+async def test_audit_chain_order_does_not_depend_on_id_order(db, ids):
+    tenant = ids["tenant_a"]
+
+    async def write(action):
+        async with db.tenant_tx(tenant) as conn:
+            await audit(conn, tenant_id=tenant, actor_type="system", actor_id=None, action=action)
+
+    async with db.tenant_tx(tenant) as first:
+        await first.execute("SELECT pg_advisory_xact_lock(hashtextextended('audit:' || %s::text, 0))", (str(tenant),))
+        second = asyncio.create_task(write("second"))  # იღებს id-ს და ელოდება ჯაჭვის lock-ს
+        for _ in range(100):
+            waiting = await (await first.execute(
+                "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).fetchone()
+            if waiting["n"]:
+                break
+            await asyncio.sleep(0.05)
+        await audit(first, tenant_id=tenant, actor_type="system", actor_id=None, action="first")
+    await second
+    async with db.tenant_tx(tenant) as conn:
+        rows = await (await conn.execute("SELECT id, action FROM audit_log ORDER BY seq")).fetchall()
+        assert [r["action"] for r in rows] == ["first", "second"] and rows[0]["id"] > rows[1]["id"]
+        assert await _verify_audit(conn) is None
 
 
 # ------------------------------------------------------------------ BYOK key flow
@@ -157,6 +208,15 @@ async def test_register_and_load_llm_key_is_tenant_bound(db, ids, box):
     assert creds.api_key == "sk-ant-valid-key-123456" and creds.model == "claude-sonnet-5"
     with pytest.raises(NoLlmCredentialError):
         await load_default_credentials(db, box, ids["tenant_b"])  # RLS: სხვა tenant ვერ ხედავს
+
+
+async def test_first_llm_key_always_becomes_default(db, ids, box):
+    router = LLMRouter({Provider.CLAUDE: FakeAdapter(Provider.CLAUDE)})
+    kwargs = dict(tenant_id=ids["tenant_a"], user_id=ids["user"], provider=Provider.CLAUDE,
+                  api_key="sk-ant-valid-key-123456", make_default=False)
+    first, _ = await register_llm_key(db, router, box, **kwargs)
+    second, _ = await register_llm_key(db, router, box, **kwargs)
+    assert first.is_default and not second.is_default
 
 
 async def test_api_llm_key_endpoints_and_otp(db, ids, box):

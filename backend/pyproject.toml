@@ -21,6 +21,8 @@ dependencies = [
     "zeep>=4.3",
     # დოკუმენტები
     "openpyxl>=3.1",
+    # Asia/Tbilisi დროის სარტყელი იმ სისტემებზეც, სადაც IANA ბაზა არ არის (Windows, მინიმალური image-ები)
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

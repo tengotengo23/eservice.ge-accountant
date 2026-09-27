@@ -66,7 +66,7 @@ class AnthropicAdapter:
                                "data": base64.standard_b64encode(att.data).decode()},
                 })
             else:
-                blocks.append({"type": "text", "text": f'<file name="{att.filename}">\n{att.as_text()}\n</file>'})
+                blocks.append({"type": "text", "text": att.as_prompt_block()})
         blocks.append({"type": "text", "text": prompt})
         return blocks
 

@@ -11,7 +11,7 @@ import csv
 import io
 from pathlib import PurePath
 
-from ..llm.base import Attachment
+from ..llm.base import Attachment, safe_filename
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 _MAX_SHEET_ROWS = 5000
@@ -56,6 +56,7 @@ def xlsx_to_csv_text(data: bytes) -> str:
 
 
 def to_attachment(data: bytes, filename: str) -> Attachment:
+    filename = safe_filename(filename)
     if len(data) > MAX_UPLOAD_BYTES:
         raise UnsupportedDocumentError(f"{filename}: ფაილი 25MB-ზე დიდია")
     media_type = detect_media_type(data, filename)

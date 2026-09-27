@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from ..llm import Effort, LLMCredentials, LLMRouter
 from .models import Money
+from .tax_calendar import tbilisi_today
 
 
 class MonthlySummary(BaseModel):
@@ -97,7 +98,7 @@ async def generate_owner_report(router: LLMRouter, creds: LLMCredentials, summar
     facts = summary.model_dump(mode="json")
     facts["profit_before_tax"] = str(summary.profit_before_tax)
     facts["vat_payable_estimate"] = str(summary.vat_payable)
-    prompt = (f"დღეს: {(today or date.today()).isoformat()}\n"
+    prompt = (f"დღეს: {(today or tbilisi_today()).isoformat()}\n"
               f"ფაქტები:\n{json.dumps(facts, ensure_ascii=False, indent=2)}")
     result = await router.structured(creds, system=REPORT_SYSTEM_PROMPT, prompt=prompt,
                                      output_model=OwnerReport, effort=Effort.LOW, max_output_tokens=4_000)

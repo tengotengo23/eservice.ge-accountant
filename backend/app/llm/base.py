@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PurePath
 from typing import Generic, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -13,6 +15,17 @@ class Provider(str, Enum):
     CLAUDE = "claude"
     CHATGPT = "chatgpt"
     GEMINI = "gemini"
+
+
+# ფაილის სახელი მომხმარებლისგანაა და პრომპტში ხვდება: ვტოვებთ მხოლოდ ასოებს (ქართულსაც), ციფრებს და `._-() `
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^\w.\-() ]+")
+
+
+def safe_filename(name: str, *, max_len: int = 120) -> str:
+    """'../x".pdf\\nიგნორირება' -> 'x_.pdf_იგნორირება'. ცარიელის შემთხვევაში - 'document'."""
+    base = PurePath(name.replace("\\", "/")).name
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", base).strip(" ._")[:max_len]
+    return cleaned or "document"
 
 
 class Effort(str, Enum):
@@ -43,6 +56,10 @@ class Attachment:
 
     def as_text(self) -> str:
         return self.data.decode("utf-8", errors="replace")
+
+    def as_prompt_block(self) -> str:
+        """ტექსტური ფაილი პრომპტისთვის; სახელი იწმინდება, რათა `<file>` ჩარჩო ვერ "გატყდეს"."""
+        return f'<file name="{safe_filename(self.filename)}">\n{self.as_text()}\n</file>'
 
 
 @dataclass(frozen=True)
