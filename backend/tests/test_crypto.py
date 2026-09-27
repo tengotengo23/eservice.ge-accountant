@@ -8,6 +8,7 @@ from app.security.crypto import (
     LocalKeyProvider,
     SecretBox,
     SecretContext,
+    build_key_provider,
     key_hint,
 )
 from app.security.redaction import RedactingFilter, redact
@@ -70,3 +71,32 @@ def test_redaction_masks_keys_and_passwords(caplog):
     with caplog.at_level(logging.INFO, logger="test.redaction"):
         logger.info("user key %s", "sk-proj-ZZZZZZZZZZZZZZZZZZZZ")
     assert "ZZZZ" not in caplog.text
+
+
+def test_redaction_covers_tracebacks_and_auth_headers(caplog):
+    logger = logging.getLogger("test.redaction.exc")
+    logger.addFilter(RedactingFilter())
+    with caplog.at_level(logging.ERROR, logger="test.redaction.exc"):
+        try:
+            raise RuntimeError("provider said: invalid key sk-ant-api03-LEAKEDLEAKED")
+        except RuntimeError:
+            logger.exception("call failed")
+    assert "LEAKEDLEAKED" not in caplog.text and "RuntimeError" in caplog.text
+
+    out = redact("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.payload.sig x-api-key: sk-ant-api03-ZZZZZZZZ")
+    assert "eyJhbGci" not in out and "ZZZZZZZZ" not in out
+    assert redact("token: Bearer abcdefgh12345678") == "token: Bearer ***"
+
+
+def test_key_provider_config_errors_are_explicit(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv("APP_LOCAL_MASTER_KEY", "")  # .env.example-დან დაკოპირებული ცარიელი მნიშვნელობა
+    with pytest.raises(RuntimeError, match="APP_LOCAL_MASTER_KEY is required"):
+        build_key_provider(Settings(_env_file=None))
+    monkeypatch.setenv("APP_LOCAL_MASTER_KEY", "bm90LTMyLWJ5dGVz")  # "not-32-bytes"
+    with pytest.raises(ValueError, match="32 bytes"):
+        build_key_provider(Settings(_env_file=None))
+    monkeypatch.setenv("APP_ENV", "production")  # არასწორი სახელი არ უნდა "გახდეს" dev
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)

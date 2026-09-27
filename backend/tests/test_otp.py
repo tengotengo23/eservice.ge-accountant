@@ -51,6 +51,7 @@ async def test_redis_broker_between_worker_and_api():
     await notified.wait()
     assert not await api.submit_code(challenge.id, "111111", tenant_id="t-2")
     assert await api.submit_code(challenge.id, "654321", tenant_id="t-1")
+    assert not await api.submit_code(challenge.id, "999999", tenant_id="t-1")  # ერთჯერადი, როგორც in-memory
     assert await task == "654321"
     assert await client.exists("test-otp:pending:" + challenge.id) == 0
     await client.aclose()

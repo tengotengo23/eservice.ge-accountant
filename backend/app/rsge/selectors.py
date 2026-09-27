@@ -26,7 +26,7 @@ class RsGeSelectors:
 
     # --- ავტორიზაცია
     username_input: str = "input[name='username']"
-    password_input: str = "input[type='password']"
+    password_input: str = "input[type='password']"  # noqa: S105 - CSS სელექტორი, არა პაროლი
     login_button: str = "button:has-text('შესვლა')"
     login_error: str = ".alert-danger"
     captcha_marker: str = "iframe[src*='captcha'], .g-recaptcha, [data-captcha], img.captcha"
@@ -34,7 +34,7 @@ class RsGeSelectors:
     otp_submit: str = "button:has-text('დადასტურება')"
     otp_error: str = ".otp-error"
     logged_in_marker: str = "a:has-text('გასვლა')"
-    forced_password_change_marker: str = "form.change-password"
+    forced_password_change_marker: str = "form.change-password"  # noqa: S105
 
     # --- დეკლარაციები
     declarations_rows: str = "table.declarations tbody tr"

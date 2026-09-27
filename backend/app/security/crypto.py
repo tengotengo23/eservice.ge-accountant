@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 from dataclasses import dataclass
 from typing import Protocol
@@ -75,8 +76,14 @@ class LocalKeyProvider:
         self._active = active_kek_id
 
     @classmethod
-    def from_base64(cls, b64_key: str, kek_id: str = "local-1") -> "LocalKeyProvider":
-        return cls({kek_id: base64.b64decode(b64_key)}, kek_id)
+    def from_base64(cls, b64_key: str, kek_id: str = "local-1") -> LocalKeyProvider:
+        try:
+            key = base64.b64decode(b64_key.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("APP_LOCAL_MASTER_KEY must be base64 of 32 random bytes") from None
+        if len(key) != 32:
+            raise ValueError(f"APP_LOCAL_MASTER_KEY must decode to 32 bytes, got {len(key)}")
+        return cls({kek_id: key}, kek_id)
 
     @property
     def kek_id(self) -> str:

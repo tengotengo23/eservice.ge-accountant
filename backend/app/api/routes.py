@@ -6,13 +6,13 @@ from datetime import date
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile, status
 from pydantic import BaseModel, Field, SecretStr
 
 from ..accounting.ai_accountant import AIAccountant
-from ..accounting.documents import MAX_UPLOAD_BYTES, UnsupportedDocumentError
+from ..accounting.documents import MAX_UPLOAD_BYTES, DocumentTooLargeError, UnsupportedDocumentError
 from ..accounting.tax_calendar import Regime, upcoming_deadlines
-from ..llm import LLMAuthError, LLMError, LLMRefusalError, Provider
+from ..llm import LLMAuthError, LLMError, LLMInputTooLargeError, LLMRefusalError, Provider
 from ..llm.router import default_model_for
 from ..services.llm_keys import (
     ModelNotAvailableError,
@@ -20,14 +20,16 @@ from ..services.llm_keys import (
     list_llm_keys,
     load_default_credentials,
     register_llm_key,
+    revoke_llm_key,
+    set_default_llm_key,
 )
-from .deps import Principal, get_db, get_otp_broker, get_router, get_secret_box, require_role
+from .deps import STAFF_ROLES, Principal, get_db, get_otp_broker, get_router, get_secret_box, require_role
 
 router = APIRouter(prefix="/v1")
 
 Owner = Annotated[Principal, Depends(require_role("owner"))]
 Member = Annotated[Principal, Depends(require_role("owner", "accountant", "viewer"))]
-Staff = Annotated[Principal, Depends(require_role("owner", "accountant"))]
+Staff = Annotated[Principal, Depends(require_role(*STAFF_ROLES))]
 
 
 # ------------------------------------------------------------------ LLM keys
@@ -82,6 +84,26 @@ async def get_llm_keys(principal: Member, db=Depends(get_db)) -> list[LlmKeyOut]
     return [LlmKeyOut(**v.__dict__) for v in await list_llm_keys(db, principal.tenant_id)]
 
 
+@router.post("/llm/credentials/{credential_id}/default", response_model=LlmKeyOut)
+async def make_llm_key_default(credential_id: UUID, principal: Owner, db=Depends(get_db)) -> LlmKeyOut:
+    try:
+        view = await set_default_llm_key(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                                         credential_id=credential_id)
+    except NoLlmCredentialError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "active LLM key not found") from None
+    return LlmKeyOut(**view.__dict__)
+
+
+@router.delete("/llm/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_llm_key(credential_id: UUID, principal: Owner, db=Depends(get_db)) -> None:
+    """გაუქმება შეუქცევადია: დაშიფრული გასაღები იშლება (crypto-shredding), ჩანაწერი რჩება აუდიტისთვის."""
+    try:
+        await revoke_llm_key(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                             credential_id=credential_id)
+    except NoLlmCredentialError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "LLM key not found") from None
+
+
 # ------------------------------------------------------------------ rs.ge SMS code (human-in-the-loop)
 
 
@@ -90,7 +112,8 @@ class OtpIn(BaseModel):
 
 
 @router.post("/rsge/otp/{challenge_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def submit_otp(challenge_id: str, body: OtpIn, principal: Staff, broker=Depends(get_otp_broker)) -> None:
+async def submit_otp(challenge_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")], body: OtpIn, principal: Staff,
+                     broker=Depends(get_otp_broker)) -> None:
     if not await broker.submit_code(challenge_id, body.code, tenant_id=str(principal.tenant_id)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "challenge expired or not found")
 
@@ -127,12 +150,21 @@ async def extract_document(principal: Staff, our_tin: Annotated[str, Query(patte
                            box=Depends(get_secret_box)) -> dict:
     """სინქრონული ვარიანტი დემოსთვის. prod: ფაილი -> S3, documents ჩანაწერი, დავალება რიგში."""
     data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, f"file exceeds {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+    # our_tin განსაზღვრავს ვალიდაციას ("მყიდველი ჩვენ ვართ"); ის უნდა ეკუთვნოდეს ამ კომპანიას (RLS)
+    async with db.tenant_tx(principal.tenant_id) as conn:
+        cur = await conn.execute("SELECT 1 FROM taxpayers WHERE tin = %s", (our_tin,))
+        if await cur.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "taxpayer with this TIN is not registered in your account")
     try:
         creds = await load_default_credentials(db, box, principal.tenant_id)
         processed = await AIAccountant(llm).process_document(creds, data, file.filename or "document",
                                                              our_tin=our_tin)
     except NoLlmCredentialError:
         raise HTTPException(status.HTTP_409_CONFLICT, "add an LLM API key first") from None
+    except (DocumentTooLargeError, LLMInputTooLargeError) as exc:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, str(exc)) from None
     except UnsupportedDocumentError as exc:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, str(exc)) from None
     except LLMAuthError:

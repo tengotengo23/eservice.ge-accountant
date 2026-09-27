@@ -7,7 +7,8 @@
 -- * საიდუმლოებები (API Keys, rs.ge პაროლები, სესიები) ინახება მხოლოდ დაშიფრულად
 --   (envelope encryption: ciphertext + wrapped_dek + kek_id). plaintext DB-ში არასდროს ხვდება.
 -- * თანხები: numeric(18,2), არასდროს float.
--- * აუდიტი: append-only, hash-chain (ცვლილება/წაშლა შეუძლებელია, ჩანაწერის ამოღება ჯაჭვს წყვეტს).
+-- * აუდიტი: append-only, hash-chain (ცვლილება/წაშლა შეუძლებელია, ჩანაწერის ამოღება ჯაჭვს წყვეტს);
+--   შემოწმება: SELECT * FROM audit_log_verify('<tenant uuid>');
 -- =====================================================================
 
 BEGIN;
@@ -317,7 +318,10 @@ CREATE CONSTRAINT TRIGGER journal_entries_balanced
     AFTER INSERT OR UPDATE OF status ON journal_entries
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_entry_balanced();
 
--- გატარებულ ჩანაწერს არ ვცვლით - შესწორება მხოლოდ შემობრუნებით (reversal)
+-- გატარებულ ჩანაწერს არ ვცვლით - შესწორება მხოლოდ შემობრუნებით (reversal).
+-- ნაკადი: INSERT (status='draft') -> სტრიქონები -> UPDATE status='posted' (ბალანსი მოწმდება COMMIT-ზე).
+-- სტრიქონის დამატებაც აკრძალულია: დაბალანსებული წყვილის (დ X / კ X) ჩამატება გატარებულ ჩანაწერს
+-- ბალანსის დარღვევის გარეშე შეცვლიდა.
 CREATE OR REPLACE FUNCTION forbid_posted_line_changes() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE v_status entry_status;
@@ -329,8 +333,26 @@ BEGIN
     END IF;
     RETURN COALESCE(NEW, OLD);
 END $$;
-CREATE TRIGGER journal_lines_immutable BEFORE UPDATE OR DELETE ON journal_lines
+CREATE TRIGGER journal_lines_immutable BEFORE INSERT OR UPDATE OR DELETE ON journal_lines
     FOR EACH ROW EXECUTE FUNCTION forbid_posted_line_changes();
+
+-- გატარებული ჩანაწერის სათაური (თარიღი!, აღწერა, დოკუმენტი) იგივე წესით: თარიღის შეცვლა ოპერაციას
+-- სხვა საგადასახადო პერიოდში "გადაიტანდა". ერთადერთი დაშვებული ცვლილება: posted -> reversed.
+CREATE OR REPLACE FUNCTION forbid_posted_entry_changes() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.status = 'draft' THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.status = 'posted' AND NEW.status = 'reversed'
+       AND to_jsonb(NEW) - 'status' = to_jsonb(OLD) - 'status' THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'journal entry % is %: posted entries are immutable; create a reversal instead', OLD.id, OLD.status
+        USING ERRCODE = 'integrity_constraint_violation';
+END $$;
+CREATE TRIGGER journal_entries_immutable BEFORE UPDATE OR DELETE ON journal_entries
+    FOR EACH ROW EXECUTE FUNCTION forbid_posted_entry_changes();
 
 -- ------------------------------------------------------------------ bank & rs.ge data
 
@@ -457,6 +479,54 @@ END $$;
 CREATE TRIGGER declarations_status_log AFTER INSERT OR UPDATE OF status ON declarations
     FOR EACH ROW EXECUTE FUNCTION log_declaration_status();
 
+-- დადასტურება DB-ის დონეზე: approved_* ველებს წერს მხოლოდ თავად დამდასტურებელი მომხმარებელი
+-- (app.actor_type='user', approved_by = app.actor_id), რომელიც ამ კომპანიის owner/accountant-ია;
+-- ან 'system' - მხოლოდ ნულოვან დეკლარაციაზე და tenant-ის auto_submit_zero თანხმობით (docs 4.3).
+-- worker-ს (ან მის ბაგს) დადასტურების "დაწერა" არ შეუძლია. app.actor_* აპლიკაცია აყენებს, ამიტომ ეს
+-- დაცვაა შეცდომებისგან და არა გატეხილი აპლიკაციისგან (ამისთვის - ცალკე DB როლი approval სერვისს).
+CREATE OR REPLACE FUNCTION guard_declaration_approval() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_actor_type text := nullif(current_setting('app.actor_type', true), '');
+    v_actor_id   uuid := nullif(current_setting('app.actor_id', true), '')::uuid;
+BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.status = 'submitted'
+       AND to_jsonb(NEW) - 'receipt_screenshot_key' - 'updated_at'
+           IS DISTINCT FROM to_jsonb(OLD) - 'receipt_screenshot_key' - 'updated_at' THEN
+        RAISE EXCEPTION 'declaration % is already submitted; file a corrected declaration instead', OLD.id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NEW.approved_by IS NOT NULL AND (TG_OP = 'INSERT'
+       OR (NEW.approved_by, NEW.approved_at, NEW.approved_fingerprint)
+          IS DISTINCT FROM (OLD.approved_by, OLD.approved_at, OLD.approved_fingerprint)) THEN
+        IF v_actor_type = 'user' THEN
+            IF NEW.approved_by IS DISTINCT FROM v_actor_id THEN
+                RAISE EXCEPTION 'approval must be recorded by the approving user'
+                    USING ERRCODE = 'insufficient_privilege';
+            END IF;
+        ELSIF v_actor_type = 'system' THEN
+            IF NOT coalesce(NEW.is_zero, false) OR NOT coalesce(
+                   (SELECT (t.settings ->> 'auto_submit_zero')::boolean FROM tenants t WHERE t.id = NEW.tenant_id),
+                   false) THEN
+                RAISE EXCEPTION 'automatic approval needs a zero declaration and the auto_submit_zero consent'
+                    USING ERRCODE = 'insufficient_privilege';
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'a declaration can be approved only by a user (actor_type=%)', coalesce(v_actor_type, 'unset')
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM tenant_members m WHERE m.tenant_id = NEW.tenant_id
+                       AND m.user_id = NEW.approved_by AND m.role IN ('owner', 'accountant')) THEN
+            RAISE EXCEPTION 'approver must be an owner or accountant of this organization'
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER declarations_approval_guard BEFORE INSERT OR UPDATE ON declarations
+    FOR EACH ROW EXECUTE FUNCTION guard_declaration_approval();
+
 CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -535,6 +605,7 @@ CREATE INDEX reminders_due_idx ON reminders (send_at) WHERE sent_at IS NULL;
 CREATE TABLE audit_log (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id       uuid NOT NULL REFERENCES tenants(id),
+    seq             bigint NOT NULL,      -- რიგითი ნომერი tenant-ის ჯაჭვში (ანიჭებს ტრიგერი, ლოკის ქვეშ)
     actor_type      actor_type NOT NULL,
     actor_id        uuid,
     action          text NOT NULL,        -- 'llm_key.created', 'declaration.approved', 'rsge.submitted', ...
@@ -544,21 +615,57 @@ CREATE TABLE audit_log (
     ip              inet,
     created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
     prev_hash       bytea,
-    hash            bytea NOT NULL
+    hash            bytea NOT NULL,
+    UNIQUE (tenant_id, seq)
 );
-CREATE INDEX audit_log_tenant_idx ON audit_log (tenant_id, id);
+
+-- ჰეში კანონიკური JSON მასივიდან: ყველა სვეტი თავის პოზიციაზე, NULL - ცხადად (concat_ws NULL-ს ტოვებდა,
+-- ამიტომ entity_type=NULL/entity_id='x' და entity_type='x'/entity_id=NULL ერთ ჰეშს იძლეოდა), დრო - UTC-ში
+-- (timestamptz-ის ტექსტი სესიის TimeZone-ზეა დამოკიდებული და სხვა სესიიდან შემოწმება ჩავარდებოდა).
+CREATE OR REPLACE FUNCTION audit_log_hash(a audit_log) RETURNS bytea
+LANGUAGE sql STABLE AS $$
+    SELECT sha256(convert_to(jsonb_build_array(
+        encode(coalesce(a.prev_hash, ''::bytea), 'hex'), a.tenant_id, a.seq, a.actor_type, a.actor_id,
+        a.action, a.entity_type, a.entity_id, a.details, a.ip,
+        to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))::text, 'UTF8'))
+$$;
 
 CREATE OR REPLACE FUNCTION audit_log_chain() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE v_last audit_log;
 BEGIN
+    -- რიგი და წინა ჰეში - tenant-ის ლოკის ქვეშ. id (identity) ლოკამდე ნაწილდება, ამიტომ პარალელურ
+    -- ტრანზაქციებში id-ის რიგი ჯაჭვის რიგს არ ემთხვევა - ჯაჭვი seq-ით მიჰყვება.
     PERFORM pg_advisory_xact_lock(hashtextextended('audit:' || NEW.tenant_id::text, 0));
-    SELECT hash INTO NEW.prev_hash FROM audit_log WHERE tenant_id = NEW.tenant_id ORDER BY id DESC LIMIT 1;
-    NEW.hash := sha256(convert_to(concat_ws('|',
-        encode(coalesce(NEW.prev_hash, ''::bytea), 'hex'), NEW.tenant_id, NEW.actor_type, NEW.actor_id,
-        NEW.action, NEW.entity_type, NEW.entity_id, NEW.details::text, NEW.created_at), 'UTF8'));
+    SELECT * INTO v_last FROM audit_log WHERE tenant_id = NEW.tenant_id ORDER BY seq DESC LIMIT 1;
+    NEW.seq := coalesce(v_last.seq, 0) + 1;
+    NEW.prev_hash := v_last.hash;
+    NEW.created_at := clock_timestamp();  -- აპლიკაცია დროს ვერ "გადაწევს"
+    NEW.hash := audit_log_hash(NEW);
     RETURN NEW;
 END $$;
 CREATE TRIGGER audit_log_chain BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION audit_log_chain();
+
+-- ჯაჭვის შემოწმება: ცვლილება (ჰეში), შუაში წაშლა ან ჩამატება (seq/prev_hash). ბოლო ჩანაწერების წაშლას
+-- ჯაჭვი თავად ვერ აჩენს - ამისთვის ბოლო ჰეში პერიოდულად გარე WORM საცავში უნდა "დაიჭედოს" (anchoring).
+CREATE OR REPLACE FUNCTION audit_log_verify(p_tenant uuid)
+RETURNS TABLE (ok boolean, checked bigint, first_broken_seq bigint, last_hash bytea)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    r audit_log;
+    v_prev bytea;
+    v_n bigint := 0;
+BEGIN
+    FOR r IN SELECT * FROM audit_log WHERE tenant_id = p_tenant ORDER BY seq LOOP
+        v_n := v_n + 1;
+        IF r.seq <> v_n OR r.prev_hash IS DISTINCT FROM v_prev OR r.hash <> audit_log_hash(r) THEN
+            RETURN QUERY SELECT false, v_n, r.seq, v_prev;
+            RETURN;
+        END IF;
+        v_prev := r.hash;
+    END LOOP;
+    RETURN QUERY SELECT true, v_n, NULL::bigint, v_prev;
+END $$;
 
 CREATE OR REPLACE FUNCTION forbid_modification() RETURNS trigger
 LANGUAGE plpgsql AS $$

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import UUID
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -25,13 +25,18 @@ class Database:
     async def close(self) -> None:
         await self._pool.close()
 
+    async def ping(self) -> None:
+        """readiness probe-ისთვის: კავშირი ცოცხალია? (tenant-ის კონტექსტი არ სჭირდება)"""
+        async with self._pool.connection(timeout=5) as conn:
+            await conn.execute("SELECT 1")
+
     @asynccontextmanager
     async def tenant_tx(self, tenant_id: UUID | str, *, actor_type: str = "user",
                         actor_id: UUID | str | None = None) -> AsyncIterator[AsyncConnection]:
         async with self._pool.connection() as conn:
             async with conn.transaction():
                 if self._set_role:
-                    await conn.execute(f'SET LOCAL ROLE "{self._set_role}"')
+                    await conn.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(self._set_role)))
                 await conn.execute(
                     "SELECT set_config('app.tenant_id', %s, true), set_config('app.actor_type', %s, true),"
                     " set_config('app.actor_id', %s, true)",

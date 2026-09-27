@@ -5,15 +5,19 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from .api.routes import router as v1
-from .config import get_settings
+from .config import check_startup_settings, get_settings
 from .db.database import Database
 from .llm import LLMRouter
 from .rsge.otp import RedisOtpBroker
+from .security.auth import build_token_verifier
 from .security.crypto import SecretBox, build_key_provider
 from .security.redaction import install_redaction
+
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -22,12 +26,15 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
     install_redaction()
+    check_startup_settings(settings)
+    # კონფიგურაციის შეცდომები (KEK, OIDC) - გაშვებისთანავე, სანამ DB/Redis-ს დავუკავშირდებით
+    app.state.secret_box = SecretBox(build_key_provider(settings))
+    app.state.token_verifier = build_token_verifier(settings)
+    app.state.llm_router = LLMRouter()
     app.state.db = Database(settings.database_url)
     await app.state.db.open()
     app.state.redis = redis.from_url(settings.redis_url)
     app.state.otp_broker = RedisOtpBroker(app.state.redis)
-    app.state.llm_router = LLMRouter()
-    app.state.secret_box = SecretBox(build_key_provider(settings))
     try:
         yield
     finally:
@@ -42,7 +49,24 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict:
+        """liveness: პროცესი ცოცხალია (დამოკიდებულებებს არ ამოწმებს - მათი გათიშვა რესტარტით არ გასწორდება)."""
         return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready(request: Request) -> JSONResponse:
+        """readiness: ტრაფიკის მიღება შეიძლება მხოლოდ მაშინ, როცა PostgreSQL და Redis ხელმისაწვდომია."""
+        checks: dict[str, str] = {}
+        for name, probe in (("postgres", lambda: request.app.state.db.ping()),
+                            ("redis", lambda: request.app.state.redis.ping())):
+            try:
+                await probe()
+                checks[name] = "ok"
+            except Exception as exc:  # noqa: BLE001 - probe-ის ნებისმიერი ჩავარდნა = not ready
+                log.warning("readiness check %s failed: %s", name, type(exc).__name__)
+                checks[name] = "unavailable"
+        ok = all(v == "ok" for v in checks.values())
+        return JSONResponse({"status": "ok" if ok else "unavailable", "checks": checks},
+                            status_code=200 if ok else 503)
 
     return app
 
