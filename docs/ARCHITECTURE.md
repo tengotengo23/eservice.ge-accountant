@@ -110,8 +110,14 @@ backend/
     api/deps.py                ავთენტიფიკაცია (oidc | dev), როლი tenant_members-იდან
     api/middleware.py          X-Request-Id (ლოგების კორელაცია), მოთხოვნის ზომის ლიმიტი
     api/routes.py              REST endpoint-ები
-  db/schema.sql                PostgreSQL სქემა (RLS, ტრიგერები, სტატუსების მანქანა, აუდიტის ჯაჭვი)
-  tests/                       95 ტესტი (Playwright ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
+    db/migrations/*.sql        PostgreSQL სქემა მიგრაციებად (RLS, ტრიგერები, სტატუსების მანქანა, აუდიტის ჯაჭვი)
+    db/migrate.py              მიგრაციების გამშვები (checksum, advisory lock, ტრანზაქცია ფაილზე)
+    services/taxpayers.py      გადამხდელები; rs.ge პაროლი და სესია (დაშიფრული), invalid -> ხელახლა არ ვცდით
+    services/planning.py       კალენდარი -> planned დეკლარაციები (ყოველდღიური cron)
+    services/rsge_otp.py       SMS-ის მოთხოვნები UI-სთვის (კოდი DB-ში არ ინახება)
+    workflows/declaration_flow.py  prepare/submit: DB <-> Playwright <-> ადამიანი, automation_runs, evidence
+    worker.py                  ARQ worker (max_tries=1 rs.ge-ზე), cron Asia/Tbilisi დროით
+  tests/                       110 ტესტი (E2E: API + worker + Chromium ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
 ```
 
 ---
@@ -156,6 +162,12 @@ sequenceDiagram
 7. ბუღალტრის შესწორებები ინახება (`document_extractions.corrections`) → eval ნაკრები.
 
 ### 4.3 ნულოვანი დეკლარაცია (ორფაზიანი, SMS კოდით)
+
+რეალიზაცია: `workflows/declaration_flow.py` (worker, ARQ). UI SMS-ის მოთხოვნას ხედავს
+`GET /v1/rsge/otp/pending`-ით (worker-ი challenge-ს `otp_challenges`-ში იწერს; კოდი - მხოლოდ Redis-ში).
+ერთ გადამხდელზე ერთდროულად ერთი ბრაუზერის სესია (`automation_runs_one_active`); crash-ის შემდეგ
+"გაჭედილი" გაშვება 30 წუთში თავისუფლდება (`stale`). rs.ge-ს მიუწვდომლობა = `portal_unavailable`
+(ხელახლა ცდა `/prepare` ან `/submit`-ით), არასწორი პაროლი = მონაცემები `invalid` (ავტომატიკა აღარ ცდის).
 
 ```mermaid
 sequenceDiagram
@@ -350,7 +362,9 @@ sequenceDiagram
 | API (გასაღები, OTP, კალენდარი, თანხმობები, ხარჯი, დეკლარაციის დადასტურება, აუდიტი) | ✅ ინტეგრაციული ტესტები PostgreSQL-ზე |
 | OIDC ავთენტიფიკაცია + MFA | ✅ ნამდვილი RS256 ხელმოწერებით (alg confusion, ვადა, aud/iss); ⚠️ IdP-ის კონფიგურაცია — deploy-ზე |
 | Docker image | ✅ non-root, healthcheck; CI ამოწმებს, რომ Chromium ეშვება appuser-ით |
-| Frontend, worker-ების რიგი, სინქრონიზაციის ამოცანები | ⏭️ შემდეგი ეტაპი |
+| Worker + დეკლარაციის ნაკადი (prepare -> SMS -> approve -> submit) | ✅ E2E: API + worker + Chromium (ყალბი პორტალი) + PostgreSQL + Redis; ✅ ხელით: ცალკე uvicorn + arq პროცესებით |
+| მიგრაციები | ✅ non-superuser მფლობელითაც (RDS-ის მსგავსად); სქემის "lint" ყველა ცხრილზე |
+| Frontend, rs.ge/ბანკის სინქრონიზაცია, PeriodFacts, შეხსენებების არხები | ⏭️ შემდეგი ეტაპი |
 
 ---
 

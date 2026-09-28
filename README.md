@@ -14,7 +14,8 @@ SaaS პლატფორმის ბირთვი, რომელიც �
 | rs.ge ავტომატიზაცია (Playwright, 2FA, ნულოვანი დეკლარაცია) | [`backend/app/rsge/browser.py`](backend/app/rsge/browser.py), [`otp.py`](backend/app/rsge/otp.py), [`selectors.py`](backend/app/rsge/selectors.py) |
 | LLM Router (Claude / ChatGPT / Gemini) | [`backend/app/llm/router.py`](backend/app/llm/router.py), [`providers/`](backend/app/llm/providers) |
 | AI ბუღალტრის ლოგიკა | [`backend/app/accounting/ai_accountant.py`](backend/app/accounting/ai_accountant.py), [`validation.py`](backend/app/accounting/validation.py), [`tax_calendar.py`](backend/app/accounting/tax_calendar.py), [`reporting.py`](backend/app/accounting/reporting.py) |
-| მონაცემთა ბაზის სქემა | [`backend/db/schema.sql`](backend/db/schema.sql) |
+| მონაცემთა ბაზის სქემა (მიგრაციები) | [`backend/app/db/migrations/`](backend/app/db/migrations), [`migrate.py`](backend/app/db/migrate.py) |
+| worker: დეკლარაციის ნაკადი (rs.ge ↔ DB ↔ მომხმარებელი) | [`backend/app/workflows/declaration_flow.py`](backend/app/workflows/declaration_flow.py), [`backend/app/worker.py`](backend/app/worker.py) |
 | საიდუმლოებების დაშიფვრა | [`backend/app/security/crypto.py`](backend/app/security/crypto.py) |
 | ავთენტიფიკაცია (OIDC + MFA) | [`backend/app/security/oidc.py`](backend/app/security/oidc.py), [`backend/app/api/deps.py`](backend/app/api/deps.py) |
 | REST API | [`backend/app/api/routes.py`](backend/app/api/routes.py) (OpenAPI: `/docs`) |
@@ -48,9 +49,13 @@ result.needs_review                                            # -> ბუღა
 | `GET /v1/llm/usage?since=` | ყველა | LLM ხარჯი: გამოძახებები, შეცდომები, ტოკენები პროვაიდერის/მოდელის მიხედვით |
 | `GET/POST /v1/consents`, `DELETE /v1/consents/{kind}` | ყველა / owner | თანხმობები (ToS, `ai_processing`, rs.ge მანდატი) ვერსიით, IP-ით, აუდიტით |
 | `POST /v1/documents/extract` | owner, accountant | დოკუმენტის ამოცნობა (სჭირდება `ai_processing` თანხმობა) |
-| `GET /v1/declarations`, `GET /v1/declarations/{id}` | ყველა | დეკლარაციები + სტატუსების ისტორია |
-| `POST /v1/declarations/{id}/approve` | owner, accountant | დადასტურება **ნანახ** ფორმაზე (`fingerprint`) |
-| `POST /v1/rsge/otp/{challenge_id}` | owner, accountant | rs.ge-ს SMS კოდი (ერთჯერადი) |
+| `POST/GET /v1/taxpayers` | owner / ყველა | გადასახადის გადამხდელები (საიდ. კოდი, რეჟიმები) |
+| `PUT/GET/DELETE /v1/taxpayers/{id}/rsge-credentials/{kind}` | owner / ყველა / owner | rs.ge მომხმარებელი/პაროლი (დაშიფრული, უკან არ ბრუნდება) |
+| `POST /v1/declarations`, `GET /v1/declarations[/{id}]` | owner, accountant / ყველა | დეკლარაციები + სტატუსების ისტორია (დამგეგმავიც ქმნის) |
+| `POST /v1/declarations/{id}/prepare` | owner, accountant | worker: rs.ge-ზე ნულოვანი დრაფტი (**არაფერი იგზავნება**) |
+| `POST /v1/declarations/{id}/approve` | owner, accountant | დადასტურება **ნანახ** ფორმაზე (`fingerprint`) -> წარდგენა რიგში |
+| `POST /v1/declarations/{id}/submit` | owner, accountant | დადასტურებულის ხელახალი წარდგენა (rs.ge-ს გაუმართაობის შემდეგ) |
+| `GET /v1/rsge/otp/pending`, `POST /v1/rsge/otp/{id}` | owner, accountant | rs.ge-მ SMS კოდი მოითხოვა -> მომხმარებელი აწვდის (ერთჯერადი) |
 | `GET /v1/calendar/upcoming` | ყველა | საგადასახადო ვადები |
 | `GET /v1/audit/verify` | owner | აუდიტის ჟურნალის ჰეშ-ჯაჭვის მთლიანობა |
 | `GET /health`, `GET /ready` | - | liveness / readiness (PostgreSQL + Redis) |
@@ -71,8 +76,16 @@ playwright install chromium
 export APP_LOCAL_MASTER_KEY=$(python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())")
 
 docker compose up -d postgres redis        # რეპოზიტორიის ძირიდან
-uvicorn app.main:app --reload
+python -m app.db.migrate --dsn postgresql://postgres:postgres@localhost:5432/ai_accountant
+uvicorn app.main:app --reload              # API
+arq app.worker.WorkerSettings              # worker (rs.ge ავტომატიზაცია, დაგეგმვა) - ცალკე ტერმინალში
 ```
+
+ან ყველაფერი ერთად: `docker compose up --build` (postgres -> migrate -> api + worker).
+
+**სქემის ცვლილება** = ახალი ფაილი `app/db/migrations/NNNN_name.sql` (გამოყენებულ მიგრაციას არ ვცვლით -
+checksum მოწმდება). ახალ ცხრილს სჭირდება `tenant_id`, RLS (ENABLE + FORCE + policy) და GRANT -
+`tests/test_migrations.py` ამას ყველა ცხრილზე ამოწმებს.
 
 ## ტესტები და lint
 
@@ -94,5 +107,6 @@ TEST_REDIS_URL=redis://localhost:6379/1 pytest   # სრული ნაკრ�
    (`APP_OIDC_MFA_AMR_VALUES`) — კოდი მზადაა (`app/security/oidc.py`), staging/prod dev რეჟიმით არ ეშვება.
 5. იურიდიული: ToS, რწმუნებულება/მანდატი, პერსონალური მონაცემების საზღვარგარეთ გადაცემა (LLM) —
    თანხმობების ტექნიკური მხარე (`/v1/consents`) მზადაა, ტექსტები იურისტმა უნდა შეადგინოს.
-6. worker-ების რიგი (ARQ/Temporal): დეკლარაციის ნაკადის (`rsge/browser.py`) მიბმა DB-სთან, შეხსენებები.
+6. `PeriodFacts`-ის შეგროვება (rs.ge SOAP სინქრონიზაცია, ბანკის ამონაწერები) -> "ორმაგი გასაღების"
+   გადაწყვეტილება დამგეგმავში; შეხსენებების გაგზავნა (email/Telegram/push). worker-ი და ნაკადი მზადაა.
 7. აუდიტის ჯაჭვის ბოლო ჰეშის პერიოდული ჩაწერა გარე WORM საცავში (`GET /v1/audit/verify` -> `last_hash`).
