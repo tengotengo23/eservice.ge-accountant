@@ -1,4 +1,18 @@
-# dev გარემო: PostgreSQL + Redis + API.  გაშვება:  docker compose up --build
+# dev გარემო: PostgreSQL + Redis + მიგრაციები + API + worker.  გაშვება:  docker compose up --build
+# (cp backend/.env.example backend/.env და შეავსეთ APP_LOCAL_MASTER_KEY)
+
+x-app: &app
+  build: ./backend
+  env_file:
+    - path: ./backend/.env
+      required: false
+  environment:
+    APP_DATABASE_URL: postgresql://ai_accountant_app:dev-only-change-me@postgres:5432/ai_accountant
+    APP_REDIS_URL: redis://redis:6379/0
+    APP_EVIDENCE_DIR: /var/lib/ai-accountant/evidence
+  volumes:
+    - evidence:/var/lib/ai-accountant/evidence
+
 services:
   postgres:
     image: postgres:16
@@ -7,8 +21,8 @@ services:
       POSTGRES_PASSWORD: postgres
     ports: ["5432:5432"]
     volumes:
+      # მხოლოდ როლი; სქემას მიგრაციები ქმნის (migrate სერვისი)
       - ./backend/db/init/00-roles.sql:/docker-entrypoint-initdb.d/00-roles.sql:ro
-      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
@@ -21,18 +35,33 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
 
-  api:
+  migrate:
+    # სქემის მფლობელის როლით; API/worker-ი მხოლოდ წარმატებული მიგრაციის შემდეგ ეშვება
     build: ./backend
-    env_file:
-      - path: ./backend/.env   # cp backend/.env.example backend/.env
-        required: false
+    command: ["python", "-m", "app.db.migrate"]
     environment:
-      APP_DATABASE_URL: postgresql://ai_accountant_app:dev-only-change-me@postgres:5432/ai_accountant
-      APP_REDIS_URL: redis://redis:6379/0
-    ports: ["8000:8000"]
+      APP_MIGRATION_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ai_accountant
     depends_on:
       postgres: {condition: service_healthy}
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  worker:
+    # rs.ge ავტომატიზაცია (Playwright), დეკლარაციების დაგეგმვა. prod-ში - ცალკე, egress მხოლოდ *.rs.ge-ზე
+    <<: *app
+    command: ["arq", "app.worker.WorkerSettings"]
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.worker.WorkerSettings"]
+      interval: 60s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
 
 volumes:
   pgdata:
+  evidence:

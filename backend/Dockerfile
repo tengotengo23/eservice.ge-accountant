@@ -20,8 +20,9 @@ RUN playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
 COPY app ./app
 RUN pip install --no-deps . && rm -rf build *.egg-info
 
-# root-ის გარეშე
-RUN useradd --create-home --uid 10001 appuser
+# root-ის გარეშე. evidence (screenshot-ები, trace) - named volume-ში, რომელიც ამ მფლობელობას იღებს
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /var/lib/ai-accountant/evidence && chown -R appuser /var/lib/ai-accountant
 USER appuser
 
 EXPOSE 8000

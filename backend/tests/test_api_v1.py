@@ -12,7 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_db, get_oidc_verifier, get_otp_broker, get_router, get_secret_box
+from app.api.deps import get_db, get_jobs, get_oidc_verifier, get_otp_broker, get_router, get_secret_box
 from app.config import Settings, get_settings
 from app.db.database import Database
 from app.llm import LLMRouter, LLMUnavailableError, Provider
@@ -43,6 +43,24 @@ class FakeLlm:
         if self.fail_with:
             raise self.fail_with
         return RawCompletion(json.dumps(VALID_DOC), kw["model"], Usage(1500, 400), request_id="req_1")
+
+
+class RecordingJobs:
+    """JobQueue-ის ყალბი ვერსია: იმახსოვრებს დავალებებს და job_id-ით დედუპლიკაციას აკეთებს, როგორც ARQ."""
+
+    def __init__(self):
+        self.jobs: dict[str, tuple] = {}
+
+    async def enqueue(self, function, *args, job_id):
+        if job_id in self.jobs:
+            return False
+        self.jobs[job_id] = (function, *args)
+        return True
+
+
+@pytest.fixture
+def jobs():
+    return RecordingJobs()
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +99,7 @@ def llm():
 
 
 @pytest.fixture
-def client(db, llm, rsa_key):
+def client(db, llm, rsa_key, jobs):
     settings = Settings(_env_file=None, auth_mode="oidc", oidc_issuer=ISSUER, oidc_audience=AUDIENCE,
                         oidc_jwks_url="https://id.example.ge/jwks", oidc_algorithms=["RS256"])
     app = create_app(with_lifespan=False, settings=settings)
@@ -91,7 +109,7 @@ def client(db, llm, rsa_key):
     app.dependency_overrides.update({
         get_settings: lambda: settings, get_oidc_verifier: lambda: verifier, get_db: lambda: db,
         get_router: lambda: LLMRouter({Provider.CLAUDE: llm}, transient_retries=0),
-        get_secret_box: lambda: box, get_otp_broker: lambda: InMemoryOtpBroker(),
+        get_secret_box: lambda: box, get_otp_broker: lambda: InMemoryOtpBroker(), get_jobs: lambda: jobs,
     })
     with TestClient(app) as c:
         yield c
@@ -217,7 +235,7 @@ def _prepared_declaration(pg_dsn, world) -> str:
             (world["tenant"], world["taxpayer"], FINGERPRINT)).fetchone()[0])
 
 
-def test_declaration_approval_binds_to_the_viewed_form(client, world, rsa_key, pg_dsn):
+def test_declaration_approval_binds_to_the_viewed_form(client, world, rsa_key, pg_dsn, jobs):
     decl = _prepared_declaration(pg_dsn, world)
     accountant, viewer = auth(rsa_key, world, "accountant"), auth(rsa_key, world, "viewer")
 
@@ -235,6 +253,8 @@ def test_declaration_approval_binds_to_the_viewed_form(client, world, rsa_key, p
     assert approved.status_code == 200, approved.text
     body = approved.json()
     assert body["status"] == "approved" and body["approved_by"] == str(world["accountant"])
+    # დადასტურება -> rs.ge-ზე წარდგენის დავალება ავტომატურად ჩადგა რიგში
+    assert jobs.jobs[body["submission_job_id"]] == ("submit_declaration", str(world["tenant"]), decl)
     assert [(e["from_status"], e["to_status"], e["actor_type"]) for e in body["events"]] == [
         (None, "draft_prepared", "system"), ("draft_prepared", "approved", "user")]
 

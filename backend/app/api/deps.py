@@ -50,6 +50,10 @@ def get_otp_broker(request: Request):
     return request.app.state.otp_broker
 
 
+def get_jobs(request: Request):
+    return request.app.state.jobs
+
+
 def get_oidc_verifier(request: Request) -> OidcVerifier | None:
     return getattr(request.app.state, "oidc", None)
 

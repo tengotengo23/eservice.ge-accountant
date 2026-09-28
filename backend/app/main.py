@@ -18,6 +18,7 @@ from .rsge.otp import RedisOtpBroker
 from .security.crypto import SecretBox, build_key_provider
 from .security.oidc import OidcVerifier
 from .security.redaction import install_redaction
+from .services.jobs import ArqJobQueue
 
 log = logging.getLogger(__name__)
 
@@ -30,15 +31,18 @@ def check_startup_settings(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import redis.asyncio as redis
+    from arq import create_pool
+    from arq.connections import RedisSettings
 
     settings = get_settings()
     check_startup_settings(settings)
     install_redaction()  # uvicorn-ის handler-ები ამ დროისთვის უკვე შექმნილია
     app.state.db = Database(settings.database_url)
     await app.state.db.open()
-    app.state.redis = redis.from_url(settings.redis_url)
+    # ArqRedis = redis.asyncio.Redis + დავალებების რიგი: ერთი კავშირი OTP-ს, readiness-ს და worker-ის რიგს
+    app.state.redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     app.state.otp_broker = RedisOtpBroker(app.state.redis)
+    app.state.jobs = ArqJobQueue(app.state.redis)
     app.state.llm_router = LLMRouter()
     app.state.secret_box = SecretBox(build_key_provider(settings))
     if settings.auth_mode == "oidc":

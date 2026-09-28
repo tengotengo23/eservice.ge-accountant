@@ -32,6 +32,15 @@ class Database:
         async with self._pool.connection(timeout=5) as conn:
             await conn.execute("SELECT 1")
 
+    async def system_tenant_ids(self) -> list[UUID]:
+        """scheduler-ისთვის: ყველა tenant-ის id (SECURITY DEFINER ფუნქციით, იხ. 0002_worker.sql)."""
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                if self._set_role:
+                    await conn.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(self._set_role)))
+                rows = await (await conn.execute("SELECT system_tenant_ids() AS id")).fetchall()
+        return [r["id"] for r in rows]
+
     @asynccontextmanager
     async def tenant_tx(self, tenant_id: UUID | str, *, actor_type: str = "user",
                         actor_id: UUID | str | None = None) -> AsyncIterator[AsyncConnection]:
@@ -69,7 +78,7 @@ class AuditChainStatus:
 
 
 async def verify_audit_chain(conn: AsyncConnection) -> AuditChainStatus:
-    """მიმდინარე tenant-ის აუდიტის ჯაჭვის მთლიანობა (იხ. audit_log_verify() schema.sql-ში)."""
+    """მიმდინარე tenant-ის აუდიტის ჯაჭვის მთლიანობა (იხ. audit_log_verify(), migrations/0001_initial.sql)."""
     row = await (await conn.execute("SELECT * FROM audit_log_verify()")).fetchone()
     last = row["last_hash"]
     return AuditChainStatus(checked=row["checked"], first_broken_seq=row["first_broken_seq"],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import date, datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -12,18 +13,23 @@ from pydantic import BaseModel, Field, SecretStr
 
 from ..accounting.ai_accountant import AIAccountant
 from ..accounting.documents import MAX_UPLOAD_BYTES, UnsupportedDocumentError
+from ..accounting.models import DeclarationType
 from ..accounting.tax_calendar import Regime, upcoming_deadlines
 from ..db.database import verify_audit_chain
 from ..llm import LLMAuthError, LLMError, LLMRefusalError, LLMRequestError, Provider
 from ..llm.router import default_model_for
 from ..services.consents import ConsentKind, grant_consent, has_active_consent, list_consents, revoke_consent
 from ..services.declarations import (
+    DeclarationExistsError,
     DeclarationNotFoundError,
     DeclarationStateError,
     approve_declaration,
+    create_declaration,
     get_declaration,
+    job_key,
     list_declarations,
 )
+from ..services.jobs import PREPARE, SUBMIT
 from ..services.llm_keys import (
     ModelNotAvailableError,
     NoLlmCredentialError,
@@ -34,7 +40,23 @@ from ..services.llm_keys import (
     set_default_llm_key,
 )
 from ..services.llm_usage import record_llm_call, usage_summary
-from .deps import Principal, client_ip, get_db, get_otp_broker, get_router, get_secret_box, require_role
+from ..services.planning import UnsupportedPeriodError
+from ..services.rsge_otp import list_pending_challenges, mark_challenge_answered
+from ..services.taxpayers import (
+    CredentialKind,
+    LegalForm,
+    TaxpayerExistsError,
+    TaxpayerNotFoundError,
+    create_taxpayer,
+    list_rsge_credentials,
+    list_taxpayers,
+    revoke_rsge_credential,
+    set_rsge_credential,
+)
+from ..workflows.declaration_flow import PREPARABLE, SUBMITTABLE
+from .deps import Principal, client_ip, get_db, get_jobs, get_otp_broker, get_router, get_secret_box, require_role
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1")
 
@@ -196,6 +218,91 @@ async def delete_consent(kind: ConsentKind, principal: Owner, request: Request, 
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no active consent of this kind")
 
 
+# ------------------------------------------------------------------ taxpayers + rs.ge credentials
+
+
+class TaxpayerIn(BaseModel):
+    tin: str = Field(pattern=r"^(\d{9}|\d{11})$")
+    legal_name: str = Field(min_length=1, max_length=300)
+    legal_form: LegalForm
+    regimes: list[Regime] = []
+    has_employees: bool = False
+    vat_registered_on: date | None = None
+
+
+class TaxpayerOut(BaseModel):
+    id: UUID
+    tin: str
+    legal_name: str
+    legal_form: str
+    regimes: list[str]
+    vat_registered_on: date | None
+    has_employees: bool
+    created_at: datetime
+
+
+class RsgeCredentialIn(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: SecretStr = Field(min_length=1, max_length=256)
+
+
+class RsgeCredentialOut(BaseModel):
+    id: UUID
+    taxpayer_id: UUID
+    kind: str
+    username_hint: str
+    status: str
+    has_session: bool
+    last_login_at: datetime | None
+    last_error_code: str | None
+    created_at: datetime
+
+
+@router.post("/taxpayers", response_model=TaxpayerOut, status_code=status.HTTP_201_CREATED, tags=["taxpayers"])
+async def post_taxpayer(body: TaxpayerIn, principal: Owner, request: Request, db=Depends(get_db)) -> TaxpayerOut:
+    try:
+        view = await create_taxpayer(db, tenant_id=principal.tenant_id, user_id=principal.user_id, tin=body.tin,
+                                     legal_name=body.legal_name, legal_form=body.legal_form,
+                                     regimes=[r.value for r in body.regimes], has_employees=body.has_employees,
+                                     vat_registered_on=body.vat_registered_on, ip=client_ip(request))
+    except TaxpayerExistsError:
+        raise HTTPException(status.HTTP_409_CONFLICT, "taxpayer with this TIN already exists") from None
+    return TaxpayerOut(**view.__dict__)
+
+
+@router.get("/taxpayers", response_model=list[TaxpayerOut], tags=["taxpayers"])
+async def get_taxpayers(principal: Member, db=Depends(get_db)) -> list[TaxpayerOut]:
+    return [TaxpayerOut(**t.__dict__) for t in await list_taxpayers(db, principal.tenant_id)]
+
+
+@router.put("/taxpayers/{taxpayer_id}/rsge-credentials/{kind}", response_model=RsgeCredentialOut, tags=["taxpayers"])
+async def put_rsge_credential(taxpayer_id: UUID, kind: CredentialKind, body: RsgeCredentialIn, principal: Owner,
+                              request: Request, db=Depends(get_db), box=Depends(get_secret_box)) -> RsgeCredentialOut:
+    """პაროლი იშიფრება და აღარასდროს ბრუნდება. ახალი პაროლი ძველ სესიას აუქმებს."""
+    try:
+        view = await set_rsge_credential(db, box, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                                         taxpayer_id=taxpayer_id, kind=kind, username=body.username,
+                                         password=body.password.get_secret_value(), ip=client_ip(request))
+    except TaxpayerNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "taxpayer not found") from None
+    return RsgeCredentialOut(**view.__dict__)
+
+
+@router.get("/taxpayers/{taxpayer_id}/rsge-credentials", response_model=list[RsgeCredentialOut], tags=["taxpayers"])
+async def get_rsge_credentials(taxpayer_id: UUID, principal: Member, db=Depends(get_db)) -> list[RsgeCredentialOut]:
+    return [RsgeCredentialOut(**c.__dict__)
+            for c in await list_rsge_credentials(db, principal.tenant_id, taxpayer_id)]
+
+
+@router.delete("/taxpayers/{taxpayer_id}/rsge-credentials/{kind}", status_code=status.HTTP_204_NO_CONTENT,
+               tags=["taxpayers"])
+async def delete_rsge_credential(taxpayer_id: UUID, kind: CredentialKind, principal: Owner, request: Request,
+                                 db=Depends(get_db)) -> None:
+    if not await revoke_rsge_credential(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                                        taxpayer_id=taxpayer_id, kind=kind, ip=client_ip(request)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "credential not found")
+
+
 # ------------------------------------------------------------------ rs.ge SMS code (human-in-the-loop)
 
 
@@ -203,10 +310,30 @@ class OtpIn(BaseModel):
     code: str = Field(pattern=r"^\s*\d{4,8}\s*$")
 
 
+class PendingOtpOut(BaseModel):
+    id: str
+    phone_hint: str | None
+    created_at: datetime
+    expires_at: datetime
+    automation_run_id: UUID
+    run_kind: str
+    declaration_id: UUID | None
+    taxpayer_id: UUID
+
+
+@router.get("/rsge/otp/pending", response_model=list[PendingOtpOut], tags=["rsge"])
+async def pending_otp(principal: Staff, db=Depends(get_db)) -> list[PendingOtpOut]:
+    """rs.ge SMS კოდს ითხოვს: UI აჩვენებს ფანჯარას "შეიყვანეთ ***-**-12 ნომერზე მოსული კოდი"."""
+    return [PendingOtpOut(**c.__dict__) for c in await list_pending_challenges(db, principal.tenant_id)]
+
+
 @router.post("/rsge/otp/{challenge_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["rsge"])
-async def submit_otp(challenge_id: str, body: OtpIn, principal: Staff, broker=Depends(get_otp_broker)) -> None:
+async def submit_otp(challenge_id: str, body: OtpIn, principal: Staff, request: Request,
+                     broker=Depends(get_otp_broker), db=Depends(get_db)) -> None:
     if not await broker.submit_code(challenge_id, body.code, tenant_id=str(principal.tenant_id)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "challenge expired, already answered or not found")
+    await mark_challenge_answered(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                                  challenge_id=challenge_id, ip=client_ip(request))
 
 
 # ------------------------------------------------------------------ declarations
@@ -237,6 +364,7 @@ class DeclarationOut(BaseModel):
     ai_decision: dict[str, Any] | None
     approved_by: UUID | None
     approved_at: datetime | None
+    approved_fingerprint: str | None
     rs_receipt_number: str | None
     submitted_at: datetime | None
     last_error_code: str | None
@@ -244,12 +372,67 @@ class DeclarationOut(BaseModel):
     events: list[DeclarationEventOut] = []
 
 
+class ApprovedDeclarationOut(DeclarationOut):
+    submission_job_id: str | None = Field(
+        description="rs.ge-ზე წარდგენის დავალება; null - რიგი მიუწვდომელია, გამოიძახეთ /submit მოგვიანებით")
+
+
+class DeclarationIn(BaseModel):
+    taxpayer_id: UUID
+    type: DeclarationType
+    period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="საანგარიშო თვე, მაგ. 2026-09")
+
+
 class ApproveIn(BaseModel):
     fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$", description="ეკრანზე ნანახი ფორმის form_fingerprint")
 
 
+class JobOut(BaseModel):
+    job_id: str
+    enqueued: bool = Field(description="false - იგივე დავალება უკვე რიგშია/სრულდება")
+
+
 def _declaration_out(view) -> DeclarationOut:
     return DeclarationOut(**{**view.__dict__, "events": [DeclarationEventOut(**e.__dict__) for e in view.events]})
+
+
+async def _load_or_404(db, tenant_id: UUID, declaration_id: UUID):
+    try:
+        return await get_declaration(db, tenant_id, declaration_id)
+    except DeclarationNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "declaration not found") from None
+
+
+def _conflict(code: str, message: str) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, {"code": code, "message": message})
+
+
+async def _check_rsge_ready(db, tenant_id: UUID, taxpayer_id: UUID) -> None:
+    """წინაპირობები UI-სთვის ცხადი შეცდომით (worker-ი იგივეს მეორედ ამოწმებს)."""
+    async with db.tenant_tx(tenant_id) as conn:
+        mandate = await has_active_consent(conn, ConsentKind.RSGE_AUTOMATION_MANDATE)
+    if not mandate:
+        raise _conflict("mandate_required", "the owner must grant the rs.ge automation mandate first")
+    creds = await list_rsge_credentials(db, tenant_id, taxpayer_id)
+    if not any(c.kind == CredentialKind.PORTAL_USER.value and c.status == "active" for c in creds):
+        raise _conflict("rsge_credential_unavailable", "add (or update) the eservice.rs.ge username and password")
+
+
+@router.post("/declarations", response_model=DeclarationOut, status_code=status.HTTP_201_CREATED,
+             tags=["declarations"])
+async def post_declaration(body: DeclarationIn, principal: Staff, request: Request,
+                           db=Depends(get_db)) -> DeclarationOut:
+    try:
+        view = await create_declaration(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
+                                        taxpayer_id=body.taxpayer_id, dtype=body.type.value, period=body.period,
+                                        ip=client_ip(request))
+    except DeclarationNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "taxpayer not found") from None
+    except DeclarationExistsError as exc:
+        raise _conflict("already_exists", str(exc)) from None
+    except UnsupportedPeriodError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
+    return _declaration_out(view)
 
 
 @router.get("/declarations", response_model=list[DeclarationOut], tags=["declarations"])
@@ -262,16 +445,28 @@ async def get_declarations(principal: Member, db=Depends(get_db),
 
 @router.get("/declarations/{declaration_id}", response_model=DeclarationOut, tags=["declarations"])
 async def get_one_declaration(declaration_id: UUID, principal: Member, db=Depends(get_db)) -> DeclarationOut:
-    try:
-        return _declaration_out(await get_declaration(db, principal.tenant_id, declaration_id))
-    except DeclarationNotFoundError:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "declaration not found") from None
+    return _declaration_out(await _load_or_404(db, principal.tenant_id, declaration_id))
 
 
-@router.post("/declarations/{declaration_id}/approve", response_model=DeclarationOut, tags=["declarations"])
+@router.post("/declarations/{declaration_id}/prepare", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED,
+             tags=["declarations"])
+async def post_prepare_declaration(declaration_id: UUID, principal: Staff, db=Depends(get_db),
+                                   jobs=Depends(get_jobs)) -> JobOut:
+    """ნულოვანი დეკლარაციის დრაფტის მომზადება rs.ge-ზე (worker). არაფერი იგზავნება - შემდეგ /approve."""
+    view = await _load_or_404(db, principal.tenant_id, declaration_id)
+    if view.status not in PREPARABLE:
+        raise _conflict("not_preparable", f"declaration is {view.status}")
+    await _check_rsge_ready(db, principal.tenant_id, view.taxpayer_id)
+    job_id = job_key("prepare", view)
+    return JobOut(job_id=job_id, enqueued=await jobs.enqueue(PREPARE, str(principal.tenant_id), str(view.id),
+                                                            job_id=job_id))
+
+
+@router.post("/declarations/{declaration_id}/approve", response_model=ApprovedDeclarationOut, tags=["declarations"])
 async def post_approve_declaration(declaration_id: UUID, body: ApproveIn, principal: Staff, request: Request,
-                                   db=Depends(get_db)) -> DeclarationOut:
-    """ადამიანის დადასტურება rs.ge-ზე წარდგენამდე. fingerprint - ზუსტად ის ფორმა, რაც მომხმარებელმა ნახა."""
+                                   db=Depends(get_db), jobs=Depends(get_jobs)) -> ApprovedDeclarationOut:
+    """ადამიანის დადასტურება rs.ge-ზე წარდგენამდე. fingerprint - ზუსტად ის ფორმა, რაც მომხმარებელმა ნახა.
+    დადასტურების შემდეგ წარდგენა ავტომატურად ჩადგება რიგში."""
     try:
         view = await approve_declaration(db, tenant_id=principal.tenant_id, user_id=principal.user_id,
                                          declaration_id=declaration_id, fingerprint=body.fingerprint,
@@ -279,8 +474,31 @@ async def post_approve_declaration(declaration_id: UUID, body: ApproveIn, princi
     except DeclarationNotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "declaration not found") from None
     except DeclarationStateError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, {"code": exc.code, "message": str(exc)}) from None
-    return _declaration_out(view)
+        raise _conflict(exc.code, str(exc)) from None
+    job_id: str | None = job_key("submit", view)
+    try:
+        await jobs.enqueue(SUBMIT, str(principal.tenant_id), str(view.id), job_id=job_id)
+    except Exception as exc:  # noqa: BLE001 - დადასტურება შენახულია; წარდგენა /submit-ით მოგვიანებით
+        log.warning("could not enqueue submission for %s: %s", view.id, type(exc).__name__)
+        job_id = None
+    return ApprovedDeclarationOut(**_declaration_out(view).model_dump(), submission_job_id=job_id)
+
+
+@router.post("/declarations/{declaration_id}/submit", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED,
+             tags=["declarations"])
+async def post_submit_declaration(declaration_id: UUID, principal: Staff, db=Depends(get_db),
+                                  jobs=Depends(get_jobs)) -> JobOut:
+    """დადასტურებული დეკლარაციის (ხელახალი) წარდგენა - მაგ. rs.ge-ს დროებითი გაუმართაობის შემდეგ."""
+    view = await _load_or_404(db, principal.tenant_id, declaration_id)
+    # "submitting"-იც დაშვებულია: worker-ის crash-ის შემდეგ ნაკადი ჯერ rs.ge-ზე ამოწმებს, ხომ არ გაიგზავნა
+    approval_valid = (view.approved_by is not None and view.form_fingerprint is not None
+                      and view.approved_fingerprint == view.form_fingerprint)
+    if view.status not in SUBMITTABLE or not approval_valid:
+        raise _conflict("not_submittable", f"declaration is {view.status}; approve the current form first")
+    await _check_rsge_ready(db, principal.tenant_id, view.taxpayer_id)
+    job_id = job_key("submit", view)
+    return JobOut(job_id=job_id, enqueued=await jobs.enqueue(SUBMIT, str(principal.tenant_id), str(view.id),
+                                                            job_id=job_id))
 
 
 # ------------------------------------------------------------------ tax calendar

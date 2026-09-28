@@ -1,5 +1,8 @@
 -- =====================================================================
--- AI-ბუღალტერი - PostgreSQL 15+ სქემა
+-- AI-ბუღალტერი - PostgreSQL 15+ სქემა (საბაზისო მიგრაცია)
+--
+-- მიგრაციებს უშვებს `python -m app.db.migrate` (თითო ფაილი - ერთი ტრანზაქცია, ამიტომ BEGIN/COMMIT
+-- აქ არ წერია). გამოყენებული მიგრაცია აღარ იცვლება: ცვლილება = ახალი ფაილი (0002_..., 0003_...).
 --
 -- * Multi-tenant: ყველა ბიზნეს-ცხრილს აქვს tenant_id + Row Level Security.
 --   აპლიკაცია ყოველ ტრანზაქციაში აკეთებს:  SELECT set_config('app.tenant_id', '<uuid>', true);
@@ -10,7 +13,6 @@
 -- * აუდიტი: append-only, hash-chain (ცვლილება/წაშლა შეუძლებელია, ჩანაწერის ამოღება ჯაჭვს წყვეტს).
 -- =====================================================================
 
-BEGIN;
 
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ai_accountant_app') THEN
@@ -690,4 +692,3 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ai_accoun
 REVOKE UPDATE, DELETE ON audit_log, declaration_events FROM ai_accountant_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ai_accountant_app;
 
-COMMIT;
