@@ -56,11 +56,13 @@ REPORT_SYSTEM_PROMPT = """\
 - action_items - კონკრეტული ქმედებები ვადებით (თუ ვადა მოცემულია).
 """
 
-_NUMBER_RE = re.compile(r"(?<![\w.])-?\d[\d\s,]*(?:\.\d+)?%?")
+# ათასების გამყოფი (space / NBSP / narrow NBSP / მძიმე) მხოლოდ 3-ციფრიან ჯგუფებს შორის: "12,500.00", "9 000".
+# ასე "2, 3 და 4" ან ორ სტრიქონზე მდგომი ციფრები ერთ რიცხვად ("23") აღარ ერწყმის ერთმანეთს.
+_NUMBER_RE = re.compile(r"(?<![\w.,])-?(?:\d{1,3}(?:[ \u00a0\u202f,]\d{3})+|\d+)(?:\.\d+)?%?(?!\d)")
 
 
 def _normalize_number(raw: str) -> Decimal | None:
-    cleaned = raw.replace(" ", "").replace(" ", "").replace(",", "")
+    cleaned = raw.replace(" ", "").replace("\u00a0", "").replace("\u202f", "").replace(",", "")
     try:
         return Decimal(cleaned)
     except ArithmeticError:

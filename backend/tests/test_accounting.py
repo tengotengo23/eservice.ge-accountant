@@ -1,13 +1,13 @@
 import io
 import json
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
 from openpyxl import Workbook
 
 from app.accounting.ai_accountant import AIAccountant, merge_decisions, rule_based_decision
-from app.accounting.documents import UnsupportedDocumentError, to_attachment
+from app.accounting.documents import UnsupportedDocumentError, to_attachment, xlsx_to_csv_text
 from app.accounting.models import (
     DeclarationAction,
     DeclarationDecision,
@@ -65,8 +65,8 @@ def test_holidays_and_extra_days_off():
 
 def test_today_is_taken_in_tbilisi_time():
     # 22:30 UTC = 02:30 თბილისში - საქართველოში უკვე მომდევნო დღეა
-    assert tbilisi_today(datetime(2026, 9, 27, 22, 30, tzinfo=timezone.utc)) == date(2026, 9, 28)
-    assert tbilisi_today(datetime(2026, 9, 27, 19, 59, tzinfo=timezone.utc)) == date(2026, 9, 27)
+    assert tbilisi_today(datetime(2026, 9, 27, 22, 30, tzinfo=UTC)) == date(2026, 9, 28)
+    assert tbilisi_today(datetime(2026, 9, 27, 19, 59, tzinfo=UTC)) == date(2026, 9, 27)
 
 
 def test_upcoming_deadlines_and_reminders():
@@ -131,6 +131,30 @@ def test_unknown_binary_is_rejected():
         to_attachment(b"\x00\x01binary", "file.exe")
 
 
+def test_gif_is_detected_and_legacy_xls_gets_a_clear_error():
+    assert to_attachment(b"GIF89a....", "scan.gif").media_type == "image/gif"
+    with pytest.raises(UnsupportedDocumentError, match="xlsx"):
+        to_attachment(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1rest", "old.xls")
+
+
+def test_xlsx_expansion_is_capped():
+    wb = Workbook()
+    for s in range(3):
+        ws = wb.create_sheet(f"s{s}")
+        for _ in range(200):
+            ws.append(["x" * 200] * 5)
+    buf = io.BytesIO()
+    wb.save(buf)
+    assert len(xlsx_to_csv_text(buf.getvalue())) > 10_000
+    with pytest.raises(UnsupportedDocumentError, match="დიდია"):
+        xlsx_to_csv_text(buf.getvalue(), max_chars=10_000)
+
+
+def test_corrupt_xlsx_is_rejected_cleanly():
+    with pytest.raises(UnsupportedDocumentError):
+        to_attachment(b"PK\x03\x04 not really a zip", "broken.xlsx")
+
+
 # ------------------------------------------------------------------ declarations
 
 
@@ -182,14 +206,17 @@ def test_merge_requires_agreement_and_confidence():
     assert merge_decisions(rule, None, threshold=0.9).action is DeclarationAction.NEEDS_HUMAN_REVIEW
 
 
-def test_merge_rejects_llm_answer_for_other_declaration_or_with_blockers():
+def test_merge_rejects_llm_answer_about_another_period_or_with_blocking_issues():
     rule = rule_based_decision(facts(), DeclarationType.VAT)
-    agree = _llm(DeclarationAction.FILE_ZERO)
-    for llm in (agree.model_copy(update={"period": "2026-08"}),
-                agree.model_copy(update={"declaration_type": DeclarationType.PROFIT_TAX}),
-                agree.model_copy(update={"blocking_issues": ["ბანკის ამონაწერი აკლია"]})):
-        final = merge_decisions(rule, llm, threshold=0.9)
-        assert final.action is DeclarationAction.NEEDS_HUMAN_REVIEW and final.reasons
+    wrong_period = _llm(DeclarationAction.FILE_ZERO).model_copy(update={"period": "2026-08"})
+    merged = merge_decisions(rule, wrong_period, threshold=0.9)
+    assert merged.action is DeclarationAction.NEEDS_HUMAN_REVIEW and "2026-08" in merged.reasons[0]
+    wrong_type = _llm(DeclarationAction.FILE_ZERO).model_copy(
+        update={"declaration_type": DeclarationType.PROFIT_TAX})
+    assert merge_decisions(rule, wrong_type, threshold=0.9).action is DeclarationAction.NEEDS_HUMAN_REVIEW
+    hedged = _llm(DeclarationAction.FILE_ZERO).model_copy(update={"blocking_issues": ["ბანკში უცნობი ჩარიცხვა"]})
+    merged = merge_decisions(rule, hedged, threshold=0.9)
+    assert merged.action is DeclarationAction.NEEDS_HUMAN_REVIEW and "ბანკში" in merged.reasons[0]
 
 
 class FixedAdapter:
@@ -247,3 +274,13 @@ def test_report_number_guard_flags_invented_numbers():
     assert unsupported_numbers(good, summary) == []
     bad = good.model_copy(update={"risks": ["ხარჯები 15%-ით გაიზარდა, ~9 000 ₾"]})
     assert unsupported_numbers(bad, summary) == ["15%", "9 000"]
+
+
+def test_report_number_guard_does_not_glue_separate_numbers():
+    summary = MonthlySummary(company_name="შპს ტესტი", period="2026-09", revenue=Decimal("1234567.89"),
+                             expenses=Decimal("0"), output_vat=Decimal("0"), input_vat=Decimal("0"),
+                             cash_balance=Decimal("0"), documents_needing_review=3, upcoming_deadlines=[])
+    report = OwnerReport(headline="შემოსავალი: 1 234 567.89 ₾",
+                         paragraphs=["განიხილეთ 2, 3 და 4 ნაბიჯი", "დოკუმენტები: 3\n4 ვადა"],
+                         action_items=[], risks=[])
+    assert unsupported_numbers(report, summary) == []

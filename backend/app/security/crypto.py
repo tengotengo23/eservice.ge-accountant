@@ -75,7 +75,7 @@ class LocalKeyProvider:
         self._active = active_kek_id
 
     @classmethod
-    def from_base64(cls, b64_key: str, kek_id: str = "local-1") -> "LocalKeyProvider":
+    def from_base64(cls, b64_key: str, kek_id: str = "local-1") -> LocalKeyProvider:
         return cls({kek_id: base64.b64decode(b64_key)}, kek_id)
 
     @property

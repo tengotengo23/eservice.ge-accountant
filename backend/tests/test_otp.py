@@ -54,3 +54,26 @@ async def test_redis_broker_between_worker_and_api():
     assert await task == "654321"
     assert await client.exists("test-otp:pending:" + challenge.id) == 0
     await client.aclose()
+
+
+@pytest.mark.redis
+@pytest.mark.skipif(not os.environ.get("TEST_REDIS_URL"), reason="TEST_REDIS_URL not set")
+async def test_redis_broker_accepts_a_code_only_once_even_concurrently():
+    import redis.asyncio as redis
+
+    client = redis.from_url(os.environ["TEST_REDIS_URL"])
+    notified = asyncio.Event()
+
+    async def notify(_challenge):
+        notified.set()
+
+    worker = RedisOtpBroker(client, notifier=notify, prefix="test-otp1")
+    api = RedisOtpBroker(client, prefix="test-otp1")
+    challenge = OtpChallenge("t-1", "c-1", ttl_seconds=5)
+    task = asyncio.create_task(worker.request_code(challenge))
+    await notified.wait()
+    results = await asyncio.gather(*(api.submit_code(challenge.id, f"11111{i}", tenant_id="t-1") for i in range(5)))
+    assert sorted(results) == [False] * 4 + [True]  # ზუსტად ერთი მიღებულია, დანარჩენები -> 404
+    winner = f"11111{results.index(True)}"
+    assert await task == winner
+    await client.aclose()

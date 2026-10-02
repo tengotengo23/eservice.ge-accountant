@@ -69,6 +69,7 @@ class LLMCredentials:
     provider: Provider
     api_key: str = field(repr=False)
     model: str | None = None
+    credential_id: str | None = None  # llm_credentials.id - ხარჯის აღრიცხვისთვის (llm_calls)
 
 
 @dataclass(frozen=True)

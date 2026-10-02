@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, get_otp_broker, get_router, get_secret_box
-from app.db.database import Database, audit
+from app.db.database import Database, audit, verify_audit_chain
 from app.llm import LLMAuthError, LLMRouter, Provider
 from app.main import create_app
 from app.rsge.otp import InMemoryOtpBroker
@@ -106,13 +106,47 @@ async def test_declaration_cannot_be_submitted_without_matching_approval(db, ids
         await conn.execute("UPDATE declarations SET status = 'approved', approved_by = %s, approved_at = now(),"
                            " approved_fingerprint = 'abc' WHERE id = %s", (ids["user"], decl))
     async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):  # submitted მხოლოდ submitting-დან
+            await conn.execute("UPDATE declarations SET status = 'submitted', rs_receipt_number = 'DKL-1',"
+                               " submitted_at = now() WHERE id = %s", (decl,))
+    async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        await conn.execute("UPDATE declarations SET status = 'submitting' WHERE id = %s", (decl,))
         await conn.execute("UPDATE declarations SET status = 'submitted', rs_receipt_number = 'DKL-1',"
                            " submitted_at = now() WHERE id = %s", (decl,))
         events = await (await conn.execute(
             "SELECT from_status, to_status, actor_type FROM declaration_events WHERE declaration_id = %s ORDER BY id",
             (decl,))).fetchall()
     assert [(e["from_status"], e["to_status"], e["actor_type"]) for e in events] == [
-        (None, "draft_prepared", "worker"), ("draft_prepared", "approved", "user"), ("approved", "submitted", "worker")]
+        (None, "draft_prepared", "worker"), ("draft_prepared", "approved", "user"),
+        ("approved", "submitting", "worker"), ("submitting", "submitted", "worker")]
+    # წარდგენილი დეკლარაცია საბოლოოა: სტატუსი და ქვითარი აღარ იცვლება
+    async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        with pytest.raises(psycopg.errors.IntegrityConstraintViolation):
+            await conn.execute("UPDATE declarations SET rs_receipt_number = 'FAKE' WHERE id = %s", (decl,))
+    async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        await conn.execute("UPDATE declarations SET receipt_screenshot_key = 'evidence/x.png' WHERE id = %s", (decl,))
+
+
+async def test_declaration_cannot_be_created_as_approved(db, ids):
+    async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await conn.execute(
+                "INSERT INTO declarations (tenant_id, taxpayer_id, type, period_start, period_end, due_date, status,"
+                " form_fingerprint, approved_by, approved_at, approved_fingerprint) VALUES (%s, %s, 'vat',"
+                " '2026-08-01', '2026-08-31', '2026-09-15', 'approved', 'f', %s, now(), 'f')",
+                (ids["tenant_a"], ids["tp_a"], ids["user"]))
+
+
+async def test_audit_log_is_append_only_hash_chain(db, ids):
+    async with db.tenant_tx(ids["tenant_a"]) as conn:
+        for action in ("a", "b"):
+            await audit(conn, tenant_id=ids["tenant_a"], actor_type="user", actor_id=ids["user"], action=action)
+        rows = await (await conn.execute("SELECT seq, prev_hash, hash FROM audit_log ORDER BY seq")).fetchall()
+    assert [r["seq"] for r in rows] == [1, 2]
+    assert rows[1]["prev_hash"] == rows[0]["hash"]
+    async with db.tenant_tx(ids["tenant_a"]) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await conn.execute("DELETE FROM audit_log")
 
 
 async def test_cross_tenant_references_are_rejected(db, ids):
@@ -125,31 +159,6 @@ async def test_cross_tenant_references_are_rejected(db, ids):
         with pytest.raises(psycopg.errors.ForeignKeyViolation):  # FK-ის შემოწმება RLS-ს გვერდს უვლის
             await conn.execute("INSERT INTO automation_runs (tenant_id, taxpayer_id, kind, declaration_id)"
                                " VALUES (%s, %s, 'canary', %s)", (ids["tenant_a"], ids["tp_a"], decl_b))
-
-
-async def _verify_audit(conn) -> int | None:
-    return (await (await conn.execute("SELECT audit_log_verify() AS broken")).fetchone())["broken"]
-
-
-async def test_audit_log_is_append_only_verifiable_hash_chain(db, ids, pg_dsn):
-    tenant = ids["tenant_a"]
-    async with db.tenant_tx(tenant) as conn:
-        for action in ("a", "b", "c"):
-            await audit(conn, tenant_id=tenant, actor_type="user", actor_id=ids["user"], action=action)
-        rows = await (await conn.execute("SELECT seq, prev_hash, hash FROM audit_log ORDER BY seq")).fetchall()
-        assert [r["seq"] for r in rows] == [1, 2, 3] and rows[1]["prev_hash"] == rows[0]["hash"]
-        await conn.execute("SET LOCAL TimeZone = 'Pacific/Auckland'")  # ჰეში სესიის პარამეტრებს არ ეყრდნობა
-        assert await _verify_audit(conn) is None
-    async with db.tenant_tx(tenant) as conn:
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            await conn.execute("DELETE FROM audit_log")
-    # superuser-ს შეუძლია ტრიგერების გამორთვა - ჯაჭვი ცვლილებასაც და წაშლასაც აჩენს
-    with psycopg.connect(pg_dsn, autocommit=True) as c:
-        c.execute("SET session_replication_role = replica")
-        c.execute("UPDATE audit_log SET details = '{\"x\": 1}' WHERE tenant_id = %s AND seq = 3", (tenant,))
-        assert c.execute("SELECT audit_log_verify(%s)", (tenant,)).fetchone()[0] == 3
-        c.execute("DELETE FROM audit_log WHERE tenant_id = %s AND seq = 1", (tenant,))
-        assert c.execute("SELECT audit_log_verify(%s)", (tenant,)).fetchone()[0] == 1
 
 
 async def test_audit_chain_order_does_not_depend_on_id_order(db, ids):
@@ -173,7 +182,28 @@ async def test_audit_chain_order_does_not_depend_on_id_order(db, ids):
     async with db.tenant_tx(tenant) as conn:
         rows = await (await conn.execute("SELECT id, action FROM audit_log ORDER BY seq")).fetchall()
         assert [r["action"] for r in rows] == ["first", "second"] and rows[0]["id"] > rows[1]["id"]
-        assert await _verify_audit(conn) is None
+        assert (await verify_audit_chain(conn)).ok
+
+
+async def test_audit_chain_verifies_independent_of_session_timezone_and_detects_tampering(db, ids, pg_dsn):
+    tenant = ids["tenant_b"]
+    async with db.tenant_tx(tenant) as conn:
+        await conn.execute("SET LOCAL TimeZone = 'Asia/Tbilisi'")
+        for action in ("x", "y", "z"):
+            await audit(conn, tenant_id=tenant, actor_type="system", actor_id=None, action=action,
+                        details={"n": action}, ip="10.0.0.1")
+    async with db.tenant_tx(tenant) as conn:
+        await conn.execute("SET LOCAL TimeZone = 'America/New_York'")
+        status = await verify_audit_chain(conn)
+    assert status.ok and status.checked == 3 and len(status.last_hash) == 64
+
+    # "თავდამსხმელი" DB-ის superuser-ით, ტრიგერების გამორთვით ცვლის ჩანაწერს
+    with psycopg.connect(pg_dsn, autocommit=True) as c:
+        c.execute("SET session_replication_role = replica")
+        c.execute("UPDATE audit_log SET details = '{\"n\": \"forged\"}' WHERE tenant_id = %s AND seq = 2", (tenant,))
+    async with db.tenant_tx(tenant) as conn:
+        status = await verify_audit_chain(conn)
+    assert not status.ok and status.first_broken_seq == 2 and status.checked == 1
 
 
 # ------------------------------------------------------------------ BYOK key flow

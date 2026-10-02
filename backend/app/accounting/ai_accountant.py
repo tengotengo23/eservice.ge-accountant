@@ -124,13 +124,15 @@ def rule_based_decision(
         if activity:
             return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში იყო დღგ-ით დასაბეგრი ოპერაციები.", activity)
         if _moved(facts.bank_inflows_unexplained_total):
-            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW, "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
+            return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
+                            "ბანკში შემოსულია თანხა, რომლის წყარო ახსნილი არ არის.",
                             [f"აუხსნელი შემოსავალი: {facts.bank_inflows_unexplained_total} ₾"])
         return decision(policy[dtype], "პერიოდში დღგ-ით დასაბეგრი ოპერაცია არ დაფიქსირებულა.")
 
     if dtype is DeclarationType.INCOME_TAX_WITHHOLDING:
         if _moved(facts.salary_payments_total) or _moved(facts.other_withholding_payments_total):
-            return decision(DeclarationAction.FILE_WITH_DATA, "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
+            return decision(DeclarationAction.FILE_WITH_DATA,
+                            "პერიოდში გაცემულია ხელფასი ან სხვა დასაბეგრი ანაზღაურება.")
         if facts.has_employees:
             return decision(DeclarationAction.NEEDS_HUMAN_REVIEW,
                             "კომპანიას ჰყავს დასაქმებულები, მაგრამ ხელფასის გაცემა არ ჩანს.",
@@ -152,7 +154,8 @@ def rule_based_decision(
     raise ValueError(f"unsupported declaration type {dtype}")
 
 
-def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *, threshold: float) -> FinalDeclarationDecision:
+def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, *,
+                    threshold: float) -> FinalDeclarationDecision:
     reasons: list[str] = []
     action = rule.action
     if llm is None:
@@ -160,9 +163,10 @@ def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, 
         if rule.action is DeclarationAction.FILE_ZERO:
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     elif rule.action is not DeclarationAction.NEEDS_HUMAN_REVIEW:
-        if llm.declaration_type is not rule.declaration_type or llm.period != rule.period:
-            # LLM-მა სხვა დეკლარაციაზე/პერიოდზე უპასუხა - მისი "თანხმობა" არაფერს ნიშნავს
-            reasons.append(f"AI-მ უპასუხა სხვა დეკლარაციაზე ({llm.declaration_type.value} {llm.period})")
+        if (llm.declaration_type, llm.period) != (rule.declaration_type, rule.period):
+            # მოდელმა სხვა დეკლარაციაზე/პერიოდზე "უპასუხა" - მისი დასკვნა ამ დეკლარაციისთვის არ ითვლება
+            reasons.append(f"AI-ის პასუხი ეხება {llm.declaration_type.value} {llm.period}-ს, "
+                           f"მოთხოვნილი იყო {rule.declaration_type.value} {rule.period}")
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
         elif llm.action is not rule.action:
             reasons.append(f"წესები: {rule.action.value}, AI: {llm.action.value} - საჭიროა ბუღალტრის გადაწყვეტილება")
@@ -171,8 +175,8 @@ def merge_decisions(rule: DeclarationDecision, llm: DeclarationDecision | None, 
             reasons.append(f"AI-ის დარწმუნებულობა დაბალია ({llm.confidence:.2f} < {threshold:.2f})")
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
         elif action is DeclarationAction.FILE_ZERO and llm.blocking_issues:
-            reasons.append("AI ეთანხმება ნულოვანს, მაგრამ ასახელებს დამაბრკოლებელ გარემოებებს")
-            reasons.extend(llm.blocking_issues)
+            # "ნულოვანი, მაგრამ..." - თვითწინააღმდეგობრივი პასუხი ავტომატურ წარდგენას არ იძლევა
+            reasons.append("AI-მ მიუთითა ხელის შემშლელი გარემოებები: " + "; ".join(llm.blocking_issues))
             action = DeclarationAction.NEEDS_HUMAN_REVIEW
     return FinalDeclarationDecision(action=action, rule_decision=rule, llm_decision=llm, reasons=reasons)
 

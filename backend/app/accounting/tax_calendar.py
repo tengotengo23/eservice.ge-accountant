@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -26,7 +26,7 @@ TBILISI = ZoneInfo("Asia/Tbilisi")
 def tbilisi_today(now: datetime | None = None) -> date:
     """"დღეს" საქართველოს დროით. სერვერი, როგორც წესი, UTC-შია: 00:00-04:00 შუალედში
     `date.today()` ჯერ კიდევ გუშინდელ დღეს აბრუნებს (ვადები, "მომავალი თარიღის" შემოწმება)."""
-    return (now or datetime.now(timezone.utc)).astimezone(TBILISI).date()
+    return (now or datetime.now(UTC)).astimezone(TBILISI).date()
 
 
 class Regime(str, Enum):
@@ -159,7 +159,7 @@ class TaxPeriod:
         return f"{self.year}-{self.month:02d}" if self.month else str(self.year)
 
     @classmethod
-    def parse(cls, value: str) -> "TaxPeriod":
+    def parse(cls, value: str) -> TaxPeriod:
         parts = value.split("-")
         return cls(int(parts[0]), int(parts[1]) if len(parts) > 1 else None)
 

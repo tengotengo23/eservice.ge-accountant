@@ -69,3 +69,9 @@ class FingerprintMismatchError(RsGeError):
 
 class ApprovalError(RsGeError):
     code = "approval_invalid"
+
+
+class PortalUnavailableError(RsGeError):
+    """rs.ge მიუწვდომელია ან ბრაუზერის/ქსელის შეცდომა (net::ERR_*, timeout ნავიგაციისას) - მოგვიანებით ცდა."""
+
+    code = "portal_unavailable"

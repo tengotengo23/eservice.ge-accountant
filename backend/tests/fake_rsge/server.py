@@ -133,7 +133,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _form_page(self, d: Declaration, saved: bool) -> bytes:
         inputs = "".join(
-            f'<label>სტრ. {i}<input type="number" step="0.01" name="line_{i}" value="{html.escape(d.values.get(f"line_{i}", ""))}"></label>'
+            f'<label>სტრ. {i}<input type="number" step="0.01" name="line_{i}" '
+            f'value="{html.escape(d.values.get(f"line_{i}", ""))}"></label>'
             for i in range(1, 6)
         )
         note = '<div class="draft-saved">დრაფტი შენახულია</div>' if saved else ""
@@ -211,7 +212,7 @@ class FakePortal:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
-    def __enter__(self) -> "FakePortal":
+    def __enter__(self) -> FakePortal:
         self._thread.start()
         return self
 
