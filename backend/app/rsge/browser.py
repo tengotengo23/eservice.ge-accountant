@@ -151,16 +151,21 @@ class RsGeBrowserSession:
         self.final_storage_state: dict[str, Any] | None = None
 
     async def __aenter__(self) -> RsGeBrowserSession:
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=self._headless,
-                                                       executable_path=self._executable_path)
-        self._context = await self._browser.new_context(
-            locale="ka-GE", timezone_id="Asia/Tbilisi", storage_state=self._storage_state,
-            viewport={"width": 1366, "height": 900},
-        )
-        await self._context.tracing.start(screenshots=True, snapshots=True)
-        self.page = await self._context.new_page()
-        self.page.set_default_timeout(self._timeout)
+        try:
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(headless=self._headless,
+                                                           executable_path=self._executable_path)
+            self._context = await self._browser.new_context(
+                locale="ka-GE", timezone_id="Asia/Tbilisi", storage_state=self._storage_state,
+                viewport={"width": 1366, "height": 900},
+            )
+            await self._context.tracing.start(screenshots=True, snapshots=True)
+            self.page = await self._context.new_page()
+            self.page.set_default_timeout(self._timeout)
+        except BaseException:
+            # __aexit__ არ გამოიძახება, თუ __aenter__ ჩავარდა - Chromium/Playwright პროცესები არ უნდა დარჩეს
+            await self._shutdown()
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -171,10 +176,17 @@ class RsGeBrowserSession:
                 await self._context.tracing.stop(path=str(self._evidence_dir / "trace.zip"))
                 self.evidence.write_manifest()
         finally:
+            await self._shutdown()
+
+    async def _shutdown(self) -> None:
+        try:
             if self._browser is not None:
                 await self._browser.close()
+        finally:
+            self._browser = self._context = self.page = None
             if self._pw is not None:
                 await self._pw.stop()
+                self._pw = None
 
 
 class RsGePortal:

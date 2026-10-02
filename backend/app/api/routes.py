@@ -12,11 +12,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from pydantic import BaseModel, Field, SecretStr
 
 from ..accounting.ai_accountant import AIAccountant
-from ..accounting.documents import MAX_UPLOAD_BYTES, UnsupportedDocumentError
+from ..accounting.documents import MAX_UPLOAD_BYTES, DocumentTooLargeError, UnsupportedDocumentError
 from ..accounting.models import DeclarationType
 from ..accounting.tax_calendar import Regime, tbilisi_today, upcoming_deadlines
 from ..db.database import verify_audit_chain
-from ..llm import LLMAuthError, LLMError, LLMRefusalError, LLMRequestError, Provider
+from ..llm import LLMAuthError, LLMError, LLMInputTooLargeError, LLMRefusalError, LLMRequestError, Provider
 from ..llm.router import default_model_for
 from ..services.consents import ConsentKind, grant_consent, has_active_consent, list_consents, revoke_consent
 from ..services.declarations import (
@@ -71,6 +71,8 @@ def _llm_http_error(exc: LLMError, *, stored_key: bool) -> HTTPException:
         return HTTPException(status.HTTP_400_BAD_REQUEST, message)
     if isinstance(exc, LLMRefusalError):
         return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "the model declined; manual review needed")
+    if isinstance(exc, LLMInputTooLargeError):
+        return HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, str(exc))
     if isinstance(exc, LLMRequestError):
         return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
     return HTTPException(status.HTTP_502_BAD_GATEWAY, "LLM provider error, try again later")
@@ -533,7 +535,12 @@ async def extract_document(principal: Staff, our_tin: Annotated[str, Query(patte
                            box=Depends(get_secret_box)) -> dict:
     """სინქრონული ვარიანტი დემოსთვის. prod: ფაილი -> S3, documents ჩანაწერი, დავალება რიგში."""
     data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, f"file exceeds {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
     async with db.tenant_tx(principal.tenant_id) as conn:
+        # our_tin განსაზღვრავს ვალიდაციას ("მყიდველი ჩვენ ვართ") - უნდა იყოს ამ ანგარიშის გადამხდელი (RLS)
+        if await (await conn.execute("SELECT 1 FROM taxpayers WHERE tin = %s", (our_tin,))).fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "taxpayer with this TIN is not registered in your account")
         if not await has_active_consent(conn, ConsentKind.AI_PROCESSING):
             # პერსონალური მონაცემები საზღვარგარეთ (LLM პროვაიდერთან) თანხმობის გარეშე არ იგზავნება
             raise HTTPException(status.HTTP_409_CONFLICT, {
@@ -548,6 +555,8 @@ async def extract_document(principal: Staff, our_tin: Annotated[str, Query(patte
     try:
         processed = await AIAccountant(llm).process_document(creds, data, file.filename or "document",
                                                              our_tin=our_tin)
+    except DocumentTooLargeError as exc:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, str(exc)) from None
     except UnsupportedDocumentError as exc:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, str(exc)) from None
     except LLMError as exc:

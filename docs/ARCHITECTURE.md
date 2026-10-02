@@ -117,7 +117,7 @@ backend/
     services/rsge_otp.py       SMS-ის მოთხოვნები UI-სთვის (კოდი DB-ში არ ინახება)
     workflows/declaration_flow.py  prepare/submit: DB <-> Playwright <-> ადამიანი, automation_runs, evidence
     worker.py                  ARQ worker (max_tries=1 rs.ge-ზე), cron Asia/Tbilisi დროით
-  tests/                       110 ტესტი (E2E: API + worker + Chromium ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
+  tests/                       126 ტესტი (E2E: API + worker + Chromium ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
 ```
 
 ---
@@ -213,6 +213,9 @@ sequenceDiagram
   `submitting` მხოლოდ `approved`-დან (ან `failed`-დან, თუ დადასტურება ისევ ვალიდურია), `submitted` მხოლოდ
   `submitting`-დან; `submitted` და `cancelled` საბოლოოა (ქვითარი/ფორმა/დადასტურება აღარ იცვლება);
   ჩანაწერი `approved` სტატუსით ვერ შეიქმნება. worker-ის ბაგიც ვერ "გამოტოვებს" ადამიანს.
+* **ვინ ადასტურებს (ტრიგერი, 0004):** `approved_*` ველებს წერს მხოლოდ თავად დამდასტურებელი
+  (`app.actor_type='user'`, `approved_by = app.actor_id`), რომელიც ამ ორგანიზაციის owner/accountant-ია;
+  worker-ი და viewer დადასტურებას ვერ ჩაწერს. `system` — მხოლოდ ნულოვანზე და `auto_submit_zero` თანხმობით.
 * **API-ს დადასტურება** (`POST /v1/declarations/{id}/approve`) იღებს იმ `fingerprint`-ს, რაც მომხმარებელმა
   ეკრანზე ნახა; თუ worker-მა ამასობაში ფორმა ხელახლა მოამზადა -> `409 form_changed`.
 * **არასწორ პაროლზე/SMS კოდზე ხელახლა არ ვცდით** — ანგარიშის დაბლოკვის რისკი.
@@ -288,6 +291,9 @@ sequenceDiagram
   პერიოდულად გარე WORM საცავში უნდა ჩაიწეროს.
 * ყოველი ცვლილება (გასაღები, თანხმობა, დადასტურება) აუდიტში იწერება მომხმარებლით და IP-ით.
 * `declaration_events` — სტატუსის ყოველი ცვლილება, ვინ (user/ai/worker/system).
+* **ჟურნალი (0004):** გატარებულ ჩანაწერს სტრიქონს ვერც შეცვლი და ვერც დაამატებ (დაბალანსებული წყვილიც),
+  სათაურს (თარიღი — სხვა საგადასახადო პერიოდში "გადატანა") ვერ შეცვლი; ერთადერთი ცვლილება
+  `posted -> reversed`, შესწორება — შემობრუნებითი გატარებით.
 * rs.ge-ს ყოველ ოპერაციაზე: screenshot-ები + `manifest.json` (sha256) + Playwright `trace.zip`
   → S3 Object Lock. დავის შემთხვევაში ჩანს, რა იყო ფორმაში და ვინ დაადასტურა.
 
@@ -365,12 +371,12 @@ sequenceDiagram
 | Playwright ნაკადი (2FA, CAPTCHA, prefill, fingerprint, idempotency) | ✅ ნამდვილ Chromium-ში, **ყალბ** localhost პორტალზე |
 | eservice.rs.ge-ს რეალური სელექტორები | ❌ ჩასაწერია (`playwright codegen`) ავტორიზებული ანგარიშით |
 | rs.ge SOAP ოპერაციების სახელები/პარამეტრები | ⚠️ გადასამოწმებელია WSDL-თან (CI-დან rs.ge მიუწვდომელია) |
-| PostgreSQL სქემა (RLS, ბალანსი, დადასტურება, აუდიტი) | ✅ ტესტები PostgreSQL 16-ზე |
+| PostgreSQL სქემა (RLS, tenant-ის FK-ები, ბალანსი, ჟურნალის უცვლელობა, დამდასტურებლის როლი, აუდიტი) | ✅ ტესტები PostgreSQL 16-ზე |
 | API (გასაღები, OTP, კალენდარი, თანხმობები, ხარჯი, დეკლარაციის დადასტურება, აუდიტი) | ✅ ინტეგრაციული ტესტები PostgreSQL-ზე |
 | OIDC ავთენტიფიკაცია + MFA | ✅ ნამდვილი RS256 ხელმოწერებით (alg confusion, ვადა, aud/iss); ⚠️ IdP-ის კონფიგურაცია — deploy-ზე |
 | Docker image | ✅ non-root, healthcheck; CI ამოწმებს, რომ Chromium ეშვება appuser-ით |
 | Worker + დეკლარაციის ნაკადი (prepare -> SMS -> approve -> submit) | ✅ E2E: API + worker + Chromium (ყალბი პორტალი) + PostgreSQL + Redis; ✅ ხელით: ცალკე uvicorn + arq პროცესებით |
-| მიგრაციები | ✅ non-superuser მფლობელითაც (RDS-ის მსგავსად); სქემის "lint" ყველა ცხრილზე |
+| მიგრაციები | ✅ non-superuser მფლობელითაც (RDS-ის მსგავსად); სქემის "lint" ყველა ცხრილზე (RLS, GRANT, FK-ში tenant_id) |
 | Frontend, rs.ge/ბანკის სინქრონიზაცია, PeriodFacts, შეხსენებების არხები | ⏭️ შემდეგი ეტაპი |
 
 ---

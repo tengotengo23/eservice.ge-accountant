@@ -9,6 +9,8 @@ _PATTERNS = [
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),  # Anthropic
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_\-]{16,}"),  # OpenAI
     re.compile(r"AIza[0-9A-Za-z_\-]{30,}"),  # Google
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=\-]{8,}"),  # Authorization: Bearer <JWT/token>
+    re.compile(r"(?i)(x-api-key|x-goog-api-key|authorization)(['\"]?\s*[:=]\s*['\"]?)[^\s'\",&]+"),
     re.compile(r"(?i)(password|passwd|pwd|api_key|apikey|secret|otp|code)(\"?\s*[:=]\s*\"?)[^\s\",&]+"),
 ]
 
@@ -17,6 +19,8 @@ def redact(text: str) -> str:
     for pattern in _PATTERNS:
         if pattern.groups >= 2:
             text = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+        elif pattern.groups == 1:
+            text = pattern.sub(lambda m: f"{m.group(1)}***", text)
         else:
             text = pattern.sub("***", text)
     return text
@@ -27,6 +31,17 @@ def _redact_arg(value):
     if value is None or isinstance(value, (bool, int, float, Decimal)):
         return value
     return redact(value if isinstance(value, str) else str(value))
+
+
+def _redact_exception(record: logging.LogRecord) -> None:
+    # traceback ცალკე ფორმატირდება და შეიძლება შეიცავდეს გასაღებს (მაგ. SDK-ის შეცდომის ტექსტში).
+    # Formatter წინასწარ შევსებულ exc_text-ს იყენებს, ამიტომ აქვე ვაფორმატებთ და ვწმენდთ.
+    if record.exc_info and not record.exc_text:
+        record.exc_text = logging.Formatter().formatException(record.exc_info)
+    if record.exc_text:
+        record.exc_text = redact(record.exc_text)
+    if record.stack_info:
+        record.stack_info = redact(record.stack_info)
 
 
 class RedactingFilter(logging.Filter):
@@ -41,6 +56,7 @@ class RedactingFilter(logging.Filter):
         self.preserve_args = preserve_args
 
     def filter(self, record: logging.LogRecord) -> bool:
+        _redact_exception(record)
         if self.preserve_args:
             record.msg = redact(record.msg if isinstance(record.msg, str) else str(record.msg))
             if isinstance(record.args, Mapping):

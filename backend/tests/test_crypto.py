@@ -90,3 +90,17 @@ def test_redaction_formats_before_masking_so_split_secrets_are_caught():
     assert record.getMessage() == "login password=*** key ***"
     broken = logging.LogRecord("app", logging.INFO, __file__, 1, "%d items", ("not-a-number",), None)
     assert RedactingFilter().filter(broken)  # გაუმართავი log გამოძახება exception-ს არ აგდებს
+
+
+def test_redaction_covers_tracebacks_and_bearer_tokens():
+    try:
+        raise RuntimeError("401 for key sk-ant-api03-SECRETSECRETSECRET")
+    except RuntimeError:
+        import sys
+
+        exc_info = sys.exc_info()
+    record = logging.LogRecord("app", logging.ERROR, __file__, 1, "call failed: %s", ("Bearer eyJhbGciOi.payload.sig",),
+                               exc_info)
+    assert RedactingFilter().filter(record)
+    line = logging.Formatter().format(record)
+    assert "SECRETSECRET" not in line and "eyJhbGciOi" not in line and "Traceback" in line

@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
+from app.accounting.documents import MAX_UPLOAD_BYTES
 from app.api.deps import get_db, get_jobs, get_oidc_verifier, get_otp_broker, get_router, get_secret_box
 from app.config import Settings, get_settings
 from app.db.database import Database
@@ -188,6 +189,19 @@ def test_extraction_requires_ai_consent_and_is_metered(client, world, rsa_key, l
     llm.fail_with = None
     assert extract().status_code == 409
     assert client.delete("/v1/consents/ai_processing", headers=owner).status_code == 404
+
+
+def test_extraction_checks_tin_ownership_and_size_before_calling_the_llm(client, world, rsa_key, llm):
+    accountant = auth(rsa_key, world, "accountant")
+    llm.fail_with = AssertionError("LLM must not be called")
+
+    def extract(tin, data):
+        return client.post("/v1/documents/extract", headers=accountant, params={"our_tin": tin},
+                           files={"file": ("invoice.pdf", data, "application/pdf")})
+
+    # სხვისი საიდენტიფიკაციო კოდით "მყიდველი ჩვენ ვართ" შემოწმება გაყალბდებოდა
+    assert extract("205000111", b"%PDF-1.7 x").status_code == 404
+    assert extract(OUR_TIN, b"%PDF-1.7" + b"0" * MAX_UPLOAD_BYTES).status_code == 413
 
 
 # ------------------------------------------------------------------ BYOK lifecycle

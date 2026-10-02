@@ -14,8 +14,10 @@ from app.llm import (
     Attachment,
     LLMAuthError,
     LLMCredentials,
+    LLMInputTooLargeError,
     LLMOutputValidationError,
     LLMRefusalError,
+    LLMRequestError,
     LLMRouter,
     LLMUnavailableError,
     Provider,
@@ -24,6 +26,7 @@ from app.llm.base import RawCompletion, Usage, safe_filename
 from app.llm.providers.anthropic_provider import AnthropicAdapter
 from app.llm.providers.gemini_provider import GeminiAdapter
 from app.llm.providers.openai_provider import OpenAIAdapter
+from app.llm.router import MAX_ENCODED_REQUEST_BYTES
 from app.llm.schema import strict_json_schema
 
 PDF = Attachment(b"%PDF-1.7 fake", "application/pdf", "invoice.pdf")
@@ -343,3 +346,70 @@ def test_filename_cannot_break_prompt_framing():
     assert safe_filename("ანგარიშ-ფაქტურა (15).pdf") == "ანგარიშ-ფაქტურა (15).pdf"
     assert safe_filename("..\\..\\C:\\x.pdf") == "x.pdf"
     assert safe_filename('"\n') == "document"
+
+
+# ------------------------------------------------------------------ error mapping (retry მხოლოდ იქ, სადაც აზრი აქვს)
+
+
+async def test_claude_413_is_input_too_large_and_not_retried():
+    captured = Captured()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured.requests.append(request)
+        return httpx2.Response(413, json={"type": "error", "error": {"type": "request_too_large",
+                                                                      "message": "Request exceeds the maximum size"}})
+
+    adapter = AnthropicAdapter(http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)),
+                               max_retries=0)
+    router = LLMRouter({Provider.CLAUDE: adapter}, backoff_base=0)
+    with pytest.raises(LLMInputTooLargeError):
+        await router.structured(LLMCredentials(Provider.CLAUDE, "k", "claude-sonnet-5"), system="s", prompt="p",
+                                output_model=ExtractedDocument)
+    assert len(captured.requests) == 1
+
+
+async def test_openai_unexpected_4xx_is_request_error_not_retried():
+    captured = Captured()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.requests.append(request)
+        return httpx.Response(413, json={"error": {"message": "too large", "type": "invalid_request_error"}})
+
+    adapter = OpenAIAdapter(http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), max_retries=0)
+    with pytest.raises(LLMInputTooLargeError):
+        await LLMRouter({Provider.CHATGPT: adapter}, backoff_base=0).structured(
+            LLMCredentials(Provider.CHATGPT, "k", "gpt-6-sol"), system="s", prompt="p", output_model=Tiny)
+    assert len(captured.requests) == 1
+
+
+async def test_gemini_network_error_is_retryable_and_falls_back():
+    """google-genai ქსელურ შეცდომას (httpx.ConnectError) არ ახვევს - ადრე ის პირდაპირ ამოდიოდა API-მდე (500)."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    gemini = GeminiAdapter(http_options=genai_types.HttpOptions(httpx_async_client=client))
+    with pytest.raises(LLMUnavailableError):
+        await gemini.list_models("k")
+
+    claude = ScriptedAdapter(Provider.CLAUDE, ['{"answer": 1}'])
+    router = LLMRouter({Provider.GEMINI: gemini, Provider.CLAUDE: claude}, transient_retries=1, backoff_base=0)
+    result = await router.structured(LLMCredentials(Provider.GEMINI, "k", "gemini-3.8-flash"), system="s",
+                                     prompt="p", output_model=Tiny, fallbacks=[LLMCredentials(Provider.CLAUDE, "k2")])
+    assert result.provider is Provider.CLAUDE
+    assert len(calls) == 1 + 2  # list_models + (1 + 1 retry) generate
+
+
+async def test_router_limits_total_encoded_size_of_all_attachments():
+    adapter = ScriptedAdapter(Provider.CLAUDE, [])
+    # თითოეული ცალკე ეტევა, მაგრამ base64-ის შემდეგ ერთად - აღარა
+    part = Attachment(b"%PDF" + b"0" * (MAX_ENCODED_REQUEST_BYTES * 2 // 5), "application/pdf", "a.pdf")
+    with pytest.raises(LLMInputTooLargeError):
+        await LLMRouter({Provider.CLAUDE: adapter}).structured(
+            LLMCredentials(Provider.CLAUDE, "k", "m"), system="s", prompt="p", output_model=Tiny,
+            attachments=(part, part))
+    assert adapter.prompts == []
+    assert issubclass(LLMInputTooLargeError, LLMRequestError)  # fallback სხვა პროვაიდერზე არ ხდება

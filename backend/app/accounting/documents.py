@@ -13,7 +13,8 @@ from pathlib import PurePath
 
 from ..llm.base import Attachment, safe_filename
 
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# base64-ის შემდეგ 20MB ≈ 26.7MB - ეტევა LLM-ის მოთხოვნის ლიმიტში (router.MAX_ENCODED_REQUEST_BYTES)
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 _MAX_SHEET_ROWS = 5000
 # xlsx შეკუმშული ZIP-ია: 25MB ფაილი შეიძლება ასობით MB ტექსტად "გაიშალოს" (zip bomb). LLM-ს
 # მაინც ვერ გავუგზავნით ამაზე დიდს, ამიტომ ვჩერდებით ადრე - მეხსიერების ამოწურვამდე.
@@ -21,6 +22,10 @@ MAX_CSV_CHARS = 4_000_000
 
 
 class UnsupportedDocumentError(ValueError):
+    pass
+
+
+class DocumentTooLargeError(UnsupportedDocumentError):
     pass
 
 
@@ -45,7 +50,8 @@ def detect_media_type(data: bytes, filename: str) -> str:
     raise UnsupportedDocumentError(f"{filename}: მხარდაუჭერელი ფორმატი (PDF, JPG, PNG, WEBP, GIF, XLSX, CSV)")
 
 
-def xlsx_to_csv_text(data: bytes, *, max_chars: int = MAX_CSV_CHARS) -> str:
+def xlsx_to_csv_text(data: bytes, *, max_chars: int = MAX_CSV_CHARS, max_rows: int = _MAX_SHEET_ROWS) -> str:
+    """ლიმიტის გადაჭარბებისას ფაილი უარიყოფა და არ "იჭრება": ნაწილობრივი ამონაწერი არასწორ ჯამებს მისცემდა."""
     from openpyxl import load_workbook
 
     try:
@@ -58,13 +64,13 @@ def xlsx_to_csv_text(data: bytes, *, max_chars: int = MAX_CSV_CHARS) -> str:
         for ws in wb.worksheets:
             out.write(f"# sheet: {ws.title}\n")
             for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= _MAX_SHEET_ROWS:
-                    out.write(f"# ... truncated after {_MAX_SHEET_ROWS} rows\n")
-                    break
+                if i >= max_rows:
+                    raise DocumentTooLargeError(
+                        f"Excel-ის ფურცელში '{ws.title}' {max_rows}-ზე მეტი სტრიქონია - დაყავით პერიოდებად")
                 if any(cell is not None for cell in row):
                     writer.writerow(["" if c is None else c for c in row])
                 if out.tell() > max_chars:
-                    raise UnsupportedDocumentError(
+                    raise DocumentTooLargeError(
                         "Excel ფაილი ზედმეტად დიდია LLM-ით დასამუშავებლად - დაყავით ან ატვირთეთ CSV-ად")
     finally:
         wb.close()
@@ -74,7 +80,7 @@ def xlsx_to_csv_text(data: bytes, *, max_chars: int = MAX_CSV_CHARS) -> str:
 def to_attachment(data: bytes, filename: str) -> Attachment:
     filename = safe_filename(filename)
     if len(data) > MAX_UPLOAD_BYTES:
-        raise UnsupportedDocumentError(f"{filename}: ფაილი 25MB-ზე დიდია")
+        raise DocumentTooLargeError(f"{filename}: ფაილი {MAX_UPLOAD_BYTES // 1024 // 1024}MB-ზე დიდია")
     media_type = detect_media_type(data, filename)
     if media_type.endswith("spreadsheetml.sheet"):
         csv_name = PurePath(filename).with_suffix(".csv").name

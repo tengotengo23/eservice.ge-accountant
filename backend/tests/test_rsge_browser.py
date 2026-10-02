@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from app.accounting.models import DeclarationType
 from app.accounting.tax_calendar import TaxPeriod
@@ -154,3 +155,11 @@ async def test_form_changed_after_approval_blocks_submission(tmp_path):
             with pytest.raises(FingerprintMismatchError):
                 await submit_zero_declaration(portal, TARGET, approval)
     assert next(iter(state.declarations.values())).status == "დრაფტი"
+
+
+async def test_failed_browser_start_does_not_leak_playwright(tmp_path):
+    s = RsGeBrowserSession(evidence_dir=tmp_path / "ev", executable_path=str(tmp_path / "no-such-chromium"))
+    with pytest.raises(PlaywrightError):
+        async with s:
+            pass
+    assert s._pw is None and s._browser is None

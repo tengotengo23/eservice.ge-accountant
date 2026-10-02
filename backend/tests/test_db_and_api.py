@@ -20,17 +20,18 @@ pytestmark = pytest.mark.postgres
 
 
 def seed(dsn: str) -> dict:
-    ids = {k: uuid.uuid4() for k in ("tenant_a", "tenant_b", "user", "tp_a", "tp_b")}
+    ids = {k: uuid.uuid4() for k in ("tenant_a", "tenant_b", "user", "viewer", "tp_a", "tp_b")}
     with psycopg.connect(dsn, autocommit=True) as c:  # superuser - RLS-ს გვერდს უვლის (მხოლოდ seed)
-        c.execute("INSERT INTO users (id, email) VALUES (%s, %s)", (ids["user"], f"{ids['user']}@example.ge"))
+        for u in ("user", "viewer"):
+            c.execute("INSERT INTO users (id, email) VALUES (%s, %s)", (ids[u], f"{ids[u]}@example.ge"))
         for t, tp, tin in (("tenant_a", "tp_a", "405123456"), ("tenant_b", "tp_b", "205000111")):
             c.execute("INSERT INTO tenants (id, name) VALUES (%s, %s)", (ids[t], t))
             c.execute("INSERT INTO taxpayers (id, tenant_id, tin, legal_name, legal_form, regimes)"
                       " VALUES (%s, %s, %s, %s, 'llc', '{vat_payer}')", (ids[tp], ids[t], tin, f"შპს {t}"))
             c.execute("INSERT INTO chart_of_accounts (tenant_id, code, name_ka, type) VALUES"
                       " (%s, '1210', 'ბანკი', 'asset'), (%s, '6110', 'შემოსავალი', 'revenue')", (ids[t], ids[t]))
-        c.execute("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (%s, %s, 'owner')",
-                  (ids["tenant_a"], ids["user"]))
+        c.execute("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (%s, %s, 'owner'), (%s, %s, 'viewer')",
+                  (ids["tenant_a"], ids["user"], ids["tenant_a"], ids["viewer"]))
     return ids
 
 
@@ -54,7 +55,7 @@ async def test_rls_isolates_tenants(db, ids):
     async with db.tenant_tx(ids["tenant_a"]) as conn:
         rows = await (await conn.execute("SELECT tin FROM taxpayers")).fetchall()
         assert [r["tin"] for r in rows] == ["405123456"]
-        assert len(await (await conn.execute("SELECT id FROM users")).fetchall()) == 1
+        assert len(await (await conn.execute("SELECT id FROM users")).fetchall()) == 2  # owner + viewer
         with pytest.raises(psycopg.errors.InsufficientPrivilege):  # WITH CHECK: სხვის tenant_id-ით ჩაწერა
             await conn.execute("INSERT INTO taxpayers (tenant_id, tin, legal_name, legal_form)"
                                " VALUES (%s, '111222333', 'x', 'llc')", (ids["tenant_b"],))
@@ -67,24 +68,40 @@ async def test_users_visible_only_to_their_tenants(db, ids):
 
 async def test_posted_entry_must_balance_and_is_immutable(db, ids):
     async def post(debit, credit):
-        async with db.tenant_tx(ids["tenant_a"]) as conn:
+        async with db.tenant_tx(ids["tenant_a"]) as conn:  # draft -> სტრიქონები -> posted
             cur = await conn.execute(
                 "INSERT INTO journal_entries (tenant_id, taxpayer_id, entry_date, description, status,"
-                " created_by_type, posted_at) VALUES (%s, %s, '2026-09-01', 'გაყიდვა', 'posted', 'user', now())"
-                " RETURNING id", (ids["tenant_a"], ids["tp_a"]))
+                " created_by_type) VALUES (%s, %s, '2026-09-01', 'გაყიდვა', 'draft', 'user') RETURNING id",
+                (ids["tenant_a"], ids["tp_a"]))
             entry = (await cur.fetchone())["id"]
             await conn.execute("INSERT INTO journal_lines (tenant_id, entry_id, account_code, debit) VALUES"
                                " (%s, %s, '1210', %s)", (ids["tenant_a"], entry, debit))
             await conn.execute("INSERT INTO journal_lines (tenant_id, entry_id, account_code, credit) VALUES"
                                " (%s, %s, '6110', %s)", (ids["tenant_a"], entry, credit))
+            await conn.execute("UPDATE journal_entries SET status = 'posted', posted_at = now() WHERE id = %s",
+                               (entry,))
         return entry
 
     with pytest.raises(psycopg.errors.CheckViolation):
         await post("100.00", "99.99")
     entry = await post("118.00", "118.00")
-    async with db.tenant_tx(ids["tenant_a"]) as conn:
-        with pytest.raises(psycopg.errors.IntegrityConstraintViolation):
-            await conn.execute("UPDATE journal_lines SET debit = 1 WHERE entry_id = %s AND debit > 0", (entry,))
+
+    async def attempt(statement, params=(entry,)):
+        async with db.tenant_tx(ids["tenant_a"]) as conn:
+            await conn.execute(statement, params)
+
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation):
+        await attempt("UPDATE journal_lines SET debit = 1 WHERE entry_id = %s AND debit > 0")
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation):  # დაბალანსებული წყვილის "ჩამატება"
+        await attempt("INSERT INTO journal_lines (tenant_id, entry_id, account_code, debit) VALUES (%s, %s, '1210', 5)",
+                      (ids["tenant_a"], entry))
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation):  # სხვა საგადასახადო პერიოდში გადატანა
+        await attempt("UPDATE journal_entries SET entry_date = '2026-08-31' WHERE id = %s")
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation):
+        await attempt("DELETE FROM journal_entries WHERE id = %s")
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation):
+        await attempt("UPDATE journal_entries SET status = 'draft' WHERE id = %s")
+    await attempt("UPDATE journal_entries SET status = 'reversed' WHERE id = %s")  # ერთადერთი დაშვებული
 
 
 async def test_declaration_cannot_be_submitted_without_matching_approval(db, ids):
@@ -125,6 +142,33 @@ async def test_declaration_cannot_be_submitted_without_matching_approval(db, ids
             await conn.execute("UPDATE declarations SET rs_receipt_number = 'FAKE' WHERE id = %s", (decl,))
     async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
         await conn.execute("UPDATE declarations SET receipt_screenshot_key = 'evidence/x.png' WHERE id = %s", (decl,))
+
+
+async def test_only_the_approving_staff_user_can_approve(db, ids):
+    async with db.tenant_tx(ids["tenant_a"], actor_type="worker") as conn:
+        cur = await conn.execute(
+            "INSERT INTO declarations (tenant_id, taxpayer_id, type, period_start, period_end, due_date,"
+            " status, is_zero, form_fingerprint) VALUES (%s, %s, 'vat', '2026-10-01', '2026-10-31', '2026-11-16',"
+            " 'draft_prepared', true, 'fp') RETURNING id", (ids["tenant_a"], ids["tp_a"]))
+        decl = (await cur.fetchone())["id"]
+    approve = ("UPDATE declarations SET status = 'approved', approved_by = %s, approved_at = now(),"
+               " approved_fingerprint = 'fp' WHERE id = %s")
+
+    async def attempt(actor_type, actor_id, approver):
+        async with db.tenant_tx(ids["tenant_a"], actor_type=actor_type, actor_id=actor_id) as conn:
+            await conn.execute(approve, (approver, decl))
+
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):  # worker-ი მომხმარებლის სახელით
+        await attempt("worker", None, ids["user"])
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):  # სხვის სახელით
+        await attempt("user", ids["viewer"], ids["user"])
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):  # viewer-ს დადასტურების უფლება არ აქვს
+        await attempt("user", ids["viewer"], ids["viewer"])
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):  # auto_submit_zero თანხმობის გარეშე
+        await attempt("system", None, ids["user"])
+    async with db.tenant_tx(ids["tenant_a"]) as conn:
+        await conn.execute("UPDATE tenants SET settings = settings || '{\"auto_submit_zero\": true}'")
+    await attempt("system", None, ids["user"])  # წესით დადასტურება: მფლობელის თანხმობა + ნულოვანი
 
 
 async def test_declaration_cannot_be_created_as_approved(db, ids):

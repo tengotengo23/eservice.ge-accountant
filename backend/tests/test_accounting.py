@@ -7,7 +7,7 @@ import pytest
 from openpyxl import Workbook
 
 from app.accounting.ai_accountant import AIAccountant, merge_decisions, rule_based_decision
-from app.accounting.documents import UnsupportedDocumentError, to_attachment, xlsx_to_csv_text
+from app.accounting.documents import DocumentTooLargeError, UnsupportedDocumentError, to_attachment, xlsx_to_csv_text
 from app.accounting.models import (
     DeclarationAction,
     DeclarationDecision,
@@ -146,8 +146,11 @@ def test_xlsx_expansion_is_capped():
     buf = io.BytesIO()
     wb.save(buf)
     assert len(xlsx_to_csv_text(buf.getvalue())) > 10_000
-    with pytest.raises(UnsupportedDocumentError, match="დიდია"):
+    with pytest.raises(DocumentTooLargeError, match="დიდია"):
         xlsx_to_csv_text(buf.getvalue(), max_chars=10_000)
+    # ადრე 5000 სტრიქონის შემდეგ ჩუმად იჭრებოდა -> ნაწილობრივი ამონაწერი, არასწორი ჯამები
+    with pytest.raises(DocumentTooLargeError, match="სტრიქონი"):
+        xlsx_to_csv_text(buf.getvalue(), max_rows=100)
 
 
 def test_corrupt_xlsx_is_rejected_cleanly():

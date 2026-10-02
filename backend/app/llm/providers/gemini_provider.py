@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -18,9 +19,13 @@ from ..base import (
     Provider,
     RawCompletion,
     Usage,
+    error_for_status,
 )
 
 _REFUSAL_FINISH = {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}
+# google-genai ქსელურ შეცდომებს არ ახვევს საკუთარ ტიპში: httpx.ConnectError / ReadTimeout პირდაპირ ამოდის.
+# ისინი OSError-ის შვილები არ არიან, ამიტომ ცალკე ვიჭერთ (სხვაგვარად retry/fallback არ ჩაირთვება).
+_NETWORK_ERRORS = (httpx.HTTPError, OSError)
 
 
 class GeminiAdapter:
@@ -49,6 +54,8 @@ class GeminiAdapter:
             raise LLMAuthError("Gemini API key is invalid or lacks permission", provider=self.provider) from exc
         if code == 429:
             raise LLMRateLimitError("Gemini rate limit / quota", provider=self.provider) from exc
+        if isinstance(code, int):
+            raise error_for_status(code, f"Gemini API error {code}: {exc}", self.provider) from exc
         if isinstance(exc, genai_errors.ClientError):
             raise LLMRequestError(f"Gemini rejected the request: {exc}", provider=self.provider) from exc
         raise LLMUnavailableError(f"Gemini API error {code}", provider=self.provider) from exc
@@ -75,7 +82,7 @@ class GeminiAdapter:
             )
         except genai_errors.APIError as exc:
             self._raise_mapped(exc)
-        except OSError as exc:  # httpx/aiohttp ქსელური შეცდომები
+        except _NETWORK_ERRORS as exc:
             raise LLMUnavailableError("Gemini API unreachable", provider=self.provider) from exc
 
         feedback = resp.prompt_feedback
@@ -102,7 +109,7 @@ class GeminiAdapter:
             models = [m async for m in pager]
         except genai_errors.APIError as exc:
             self._raise_mapped(exc)
-        except OSError as exc:
+        except _NETWORK_ERRORS as exc:
             raise LLMUnavailableError("Gemini API unreachable", provider=self.provider) from exc
         return sorted(
             m.name.removeprefix("models/")
