@@ -117,7 +117,7 @@ backend/
     services/rsge_otp.py       SMS-ის მოთხოვნები UI-სთვის (კოდი DB-ში არ ინახება)
     workflows/declaration_flow.py  prepare/submit: DB <-> Playwright <-> ადამიანი, automation_runs, evidence
     worker.py                  ARQ worker (max_tries=1 rs.ge-ზე), cron Asia/Tbilisi დროით
-  tests/                       126 ტესტი (E2E: API + worker + Chromium ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
+  tests/                       130 ტესტი (E2E: API + worker + Chromium ყალბ პორტალზე, PostgreSQL, Redis, OIDC)
 ```
 
 ---
@@ -296,6 +296,20 @@ sequenceDiagram
   `posted -> reversed`, შესწორება — შემობრუნებითი გატარებით.
 * rs.ge-ს ყოველ ოპერაციაზე: screenshot-ები + `manifest.json` (sha256) + Playwright `trace.zip`
   → S3 Object Lock. დავის შემთხვევაში ჩანს, რა იყო ფორმაში და ვინ დაადასტურა.
+
+
+### 5.5 Rate limit (`security/ratelimit.py`)
+
+| ოპერაცია | ლიმიტი | რატომ |
+|----------|--------|-------|
+| `POST /v1/llm/credentials` | 10 / საათი / tenant | გასაღები ყოველ ჯერზე პროვაიდერთან მოწმდება — ლიმიტის გარეშე პლატფორმა მოპარული გასაღებების „შემმოწმებლად“ გამოდგებოდა |
+| `PUT /v1/taxpayers/{id}/rsge-credentials/{kind}` | 10 / საათი / tenant | rs.ge პაროლის მრავალჯერადი ცვლა/შემოწმება ანგარიშს ბლოკავს |
+| `POST /v1/rsge/otp/{id}` | 10 / 10 წთ / მომხმარებელი | SMS კოდის „გადარჩევა“ |
+| `POST /v1/documents/extract` | 60 / წთ / tenant | API პროცესში LLM-ს ელოდება |
+
+Fixed window, Redis-ში ატომურად (Lua: `INCR` + `EXPIRE`), ყველა replica-სთვის საერთო. ლიმიტი მოწმდება
+ავთენტიფიკაციისა და როლის შემდეგ (401/403 მას არ ხარჯავს); გადაჭარბებისას — `429` + `Retry-After`.
+Redis-ის გაუმართაობისას ლიმიტი არ მოქმედებს (fail-open + warning), რომ API არ გაჩერდეს.
 
 ---
 

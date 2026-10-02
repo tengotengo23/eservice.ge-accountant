@@ -320,3 +320,42 @@ async def test_api_llm_key_endpoints_and_otp(db, ids, box):
                          params={"regimes": ["vat_payer"], "today": "2026-09-27", "horizon_days": 30}).json()
         assert cal[0]["due_date"] == "2026-10-15"
         assert client.get("/v1/llm/credentials").status_code == 401
+
+
+def _key_api(db, box, limiter=None):
+    from app.api.deps import get_rate_limiter
+
+    app = create_app(with_lifespan=False)
+    app.dependency_overrides.update({
+        get_db: lambda: db, get_secret_box: lambda: box,
+        get_router: lambda: LLMRouter({Provider.CLAUDE: FakeAdapter(Provider.CLAUDE)}),
+    })
+    if limiter is not None:
+        app.dependency_overrides[get_rate_limiter] = lambda: limiter
+    return app
+
+
+async def test_llm_key_validation_is_rate_limited_per_tenant(db, ids, box):
+    """გასაღების ყოველი შემოწმება პროვაიდერთან მიდის: ლიმიტის გარეშე - მოპარული გასაღებების "შემმოწმებელი"."""
+    def headers(tenant, role="owner"):
+        return {"X-Tenant-Id": str(ids[tenant]), "X-User-Id": str(ids["user"]), "X-Role": role}
+
+    bad = {"provider": "claude", "api_key": "sk-ant-stolen-000000"}
+    with TestClient(_key_api(db, box)) as client:
+        assert client.post("/v1/llm/credentials", headers=headers("tenant_a", "viewer"), json=bad).status_code == 403
+        assert [client.post("/v1/llm/credentials", headers=headers("tenant_a"), json=bad).status_code
+                for _ in range(10)] == [400] * 10  # viewer-ის 403 ლიმიტს არ ხარჯავს
+        limited = client.post("/v1/llm/credentials", headers=headers("tenant_a"), json=bad)
+        assert limited.status_code == 429 and 0 < int(limited.headers["retry-after"]) <= 3600
+        assert client.post("/v1/llm/credentials", headers=headers("tenant_b"), json=bad).status_code == 400
+
+
+async def test_rate_limiter_outage_does_not_take_the_api_down(db, ids, box):
+    class Down:
+        async def hit(self, *args):
+            raise ConnectionError("redis is down")
+
+    with TestClient(_key_api(db, box, Down())) as client:
+        r = client.post("/v1/llm/credentials", json={"provider": "claude", "api_key": "sk-ant-valid-key-123456"},
+                        headers={"X-Tenant-Id": str(ids["tenant_a"]), "X-User-Id": str(ids["user"])})
+        assert r.status_code == 201, r.text

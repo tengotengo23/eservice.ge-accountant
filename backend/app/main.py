@@ -17,6 +17,7 @@ from .llm import LLMRouter
 from .rsge.otp import RedisOtpBroker
 from .security.crypto import SecretBox, build_key_provider
 from .security.oidc import OidcVerifier
+from .security.ratelimit import RedisRateLimiter
 from .security.redaction import install_redaction
 from .services.jobs import ArqJobQueue
 
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
     # ArqRedis = redis.asyncio.Redis + დავალებების რიგი: ერთი კავშირი OTP-ს, readiness-ს და worker-ის რიგს
     app.state.redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     app.state.otp_broker = RedisOtpBroker(app.state.redis)
+    app.state.rate_limiter = RedisRateLimiter(app.state.redis)
     app.state.jobs = ArqJobQueue(app.state.redis)
     app.state.llm_router = LLMRouter()
     app.state.secret_box = SecretBox(build_key_provider(settings))

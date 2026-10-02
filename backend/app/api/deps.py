@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from ipaddress import ip_address
 from uuid import UUID
@@ -16,6 +17,9 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from ..config import Settings, get_settings
 from ..security.oidc import AuthError, OidcVerifier
+from ..security.ratelimit import InMemoryRateLimiter, Limit, RateLimiter
+
+log = logging.getLogger(__name__)
 
 ROLES = ("owner", "accountant", "viewer")
 _BEARER_CHALLENGE = {"WWW-Authenticate": 'Bearer realm="ai-accountant"'}
@@ -52,6 +56,13 @@ def get_otp_broker(request: Request):
 
 def get_jobs(request: Request):
     return request.app.state.jobs
+
+
+def get_rate_limiter(request: Request) -> RateLimiter:
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:  # lifespan-ის გარეშე (ტესტები): ერთი პროცესის მრიცხველი
+        limiter = request.app.state.rate_limiter = InMemoryRateLimiter()
+    return limiter
 
 
 def get_oidc_verifier(request: Request) -> OidcVerifier | None:
@@ -125,5 +136,23 @@ def require_role(*roles: str):
         if principal.role not in roles:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "insufficient role")
         return principal
+
+    return checker
+
+
+def rate_limit(rule: Limit):
+    """endpoint-ში ცალკე პარამეტრად, როლის შემოწმების შემდეგ: 401/403 პასუხი ლიმიტს არ ხარჯავს."""
+
+    async def checker(principal: Principal = Depends(get_principal),
+                      limiter: RateLimiter = Depends(get_rate_limiter)) -> None:
+        subject = principal.user_id if rule.per == "user" else principal.tenant_id
+        try:
+            retry_after = await limiter.hit(f"{rule.name}:{subject}", rule.limit, rule.window_seconds)
+        except Exception as exc:  # noqa: BLE001 - Redis მიუწვდომელია: fail-open
+            log.warning("rate limiter unavailable (%s); %s not limited", type(exc).__name__, rule.name)
+            return
+        if retry_after is not None:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many requests, try again later",
+                                headers={"Retry-After": str(retry_after)})
 
     return checker

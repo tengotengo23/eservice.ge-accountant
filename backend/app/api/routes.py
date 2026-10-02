@@ -18,6 +18,7 @@ from ..accounting.tax_calendar import Regime, tbilisi_today, upcoming_deadlines
 from ..db.database import verify_audit_chain
 from ..llm import LLMAuthError, LLMError, LLMInputTooLargeError, LLMRefusalError, LLMRequestError, Provider
 from ..llm.router import default_model_for
+from ..security import ratelimit
 from ..services.consents import ConsentKind, grant_consent, has_active_consent, list_consents, revoke_consent
 from ..services.declarations import (
     DeclarationExistsError,
@@ -54,7 +55,17 @@ from ..services.taxpayers import (
     set_rsge_credential,
 )
 from ..workflows.declaration_flow import PREPARABLE, SUBMITTABLE
-from .deps import Principal, client_ip, get_db, get_jobs, get_otp_broker, get_router, get_secret_box, require_role
+from .deps import (
+    Principal,
+    client_ip,
+    get_db,
+    get_jobs,
+    get_otp_broker,
+    get_router,
+    get_secret_box,
+    rate_limit,
+    require_role,
+)
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +74,11 @@ router = APIRouter(prefix="/v1")
 Owner = Annotated[Principal, Depends(require_role("owner"))]
 Member = Annotated[Principal, Depends(require_role("owner", "accountant", "viewer"))]
 Staff = Annotated[Principal, Depends(require_role("owner", "accountant"))]
+
+LimitKeyValidation = Annotated[None, Depends(rate_limit(ratelimit.LLM_KEY_VALIDATION))]
+LimitRsgeCredential = Annotated[None, Depends(rate_limit(ratelimit.RSGE_CREDENTIAL))]
+LimitOtp = Annotated[None, Depends(rate_limit(ratelimit.OTP_SUBMIT))]
+LimitExtract = Annotated[None, Depends(rate_limit(ratelimit.DOCUMENT_EXTRACT))]
 
 
 def _llm_http_error(exc: LLMError, *, stored_key: bool) -> HTTPException:
@@ -134,8 +150,8 @@ async def providers() -> list[ProviderInfo]:
 
 
 @router.post("/llm/credentials", response_model=LlmKeyOut, status_code=status.HTTP_201_CREATED, tags=["llm"])
-async def create_llm_key(body: CreateLlmKey, principal: Owner, request: Request, db=Depends(get_db),
-                         llm=Depends(get_router), box=Depends(get_secret_box)) -> LlmKeyOut:
+async def create_llm_key(body: CreateLlmKey, principal: Owner, _: LimitKeyValidation, request: Request,
+                         db=Depends(get_db), llm=Depends(get_router), box=Depends(get_secret_box)) -> LlmKeyOut:
     try:
         view, available = await register_llm_key(
             db, llm, box, tenant_id=principal.tenant_id, user_id=principal.user_id, provider=body.provider,
@@ -279,7 +295,8 @@ async def get_taxpayers(principal: Member, db=Depends(get_db)) -> list[TaxpayerO
 
 @router.put("/taxpayers/{taxpayer_id}/rsge-credentials/{kind}", response_model=RsgeCredentialOut, tags=["taxpayers"])
 async def put_rsge_credential(taxpayer_id: UUID, kind: CredentialKind, body: RsgeCredentialIn, principal: Owner,
-                              request: Request, db=Depends(get_db), box=Depends(get_secret_box)) -> RsgeCredentialOut:
+                              _: LimitRsgeCredential, request: Request, db=Depends(get_db),
+                              box=Depends(get_secret_box)) -> RsgeCredentialOut:
     """პაროლი იშიფრება და აღარასდროს ბრუნდება. ახალი პაროლი ძველ სესიას აუქმებს."""
     try:
         view = await set_rsge_credential(db, box, tenant_id=principal.tenant_id, user_id=principal.user_id,
@@ -330,7 +347,7 @@ async def pending_otp(principal: Staff, db=Depends(get_db)) -> list[PendingOtpOu
 
 
 @router.post("/rsge/otp/{challenge_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["rsge"])
-async def submit_otp(challenge_id: str, body: OtpIn, principal: Staff, request: Request,
+async def submit_otp(challenge_id: str, body: OtpIn, principal: Staff, _: LimitOtp, request: Request,
                      broker=Depends(get_otp_broker), db=Depends(get_db)) -> None:
     if not await broker.submit_code(challenge_id, body.code, tenant_id=str(principal.tenant_id)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "challenge expired, already answered or not found")
@@ -530,7 +547,8 @@ async def calendar(principal: Member, regimes: Annotated[list[Regime], Query()],
 
 
 @router.post("/documents/extract", tags=["documents"])
-async def extract_document(principal: Staff, our_tin: Annotated[str, Query(pattern=r"^(\d{9}|\d{11})$")],
+async def extract_document(principal: Staff, _: LimitExtract,
+                           our_tin: Annotated[str, Query(pattern=r"^(\d{9}|\d{11})$")],
                            file: UploadFile = File(...), db=Depends(get_db), llm=Depends(get_router),
                            box=Depends(get_secret_box)) -> dict:
     """სინქრონული ვარიანტი დემოსთვის. prod: ფაილი -> S3, documents ჩანაწერი, დავალება რიგში."""
